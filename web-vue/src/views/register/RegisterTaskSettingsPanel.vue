@@ -420,7 +420,7 @@
           />
         </label>
 
-        <label class="register-field">
+        <label v-if="config.grok.provider !== 'local'" class="register-field">
           <span class="register-label">API Key</span>
           <Input
             v-model.trim="config.grok.api_key"

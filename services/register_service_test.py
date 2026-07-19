@@ -885,6 +885,9 @@ class RegisterServiceGrokTest(unittest.TestCase):
         self.assertTrue(config["grok"]["xai_cli_oauth_enabled"])
         self.assertEqual(config["grok"]["custom_option"], "kept")
 
+        local = _normalize({"target": "grok", "grok": {"provider": "local"}})
+        self.assertEqual(local["grok"]["provider"], "local")
+
         disabled = _normalize({"target": "grok", "grok": {"xai_cli_oauth_enabled": False}})
         self.assertFalse(disabled["grok"]["xai_cli_oauth_enabled"])
 

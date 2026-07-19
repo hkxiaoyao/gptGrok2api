@@ -23,6 +23,7 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | iCloud 定时创建 | 按 Apple 账号定时创建邮箱；新接口每小时最多 20 个、旧接口每小时最多 5 个，每账号累计 750 个后自动停止。sidecar 使用 Compose 内部网络，不需要独立账号或宿主机端口。 |
 | 邮箱平台标签 | 同一邮箱可分别标记 GPT 和 Grok；GPT 标签为绿色、Grok 标签为蓝色，两个标签同时存在才算已使用，注册领取按目标平台隔离。 |
 | 注册中心 | 支持 OpenAI 与 Grok 注册任务，整合临时邮箱、GPTMail、Outlook Token、Microsoft Alias 和 iCloud Privacy Mail；内置 iCloud provider 不需要填写域名、API Base 或 API Key。 |
+| 本地 Captcha Solver | 源码内置于 `captcha-solver/`，使用 CloakBrowser/Chromium 处理 Grok Turnstile 实页校验，支持注册代理按请求透传，不需要额外克隆第二个仓库。 |
 | Checkout 提链 | 注册 Checkout 仅保留 UPI 最终支付链接提取；IN Checkout、Provider、Approve 共享同一 sticky 出口，VN Promotion 使用独立代理持续轮换重试。 |
 | 代理与稳定出口 | 支持全局代理、账号代理、代理配置、代理组、节点并发限制、故障反馈、备用出口、WARP、Privoxy、FlareSolverr 和 Clearance 刷新。 |
 | 外部系统接入 | 支持从 Sub2API、远程 CPA、本地 CPA 和 Access Token 导入账号；服务器部署提供 `gptgrok2api` Docker 网络别名。 |
@@ -47,6 +48,18 @@ docker compose -f docker-compose.warp.yml --profile local-icloud up -d
 注册区的邮箱 provider 有两种 iCloud 入口：`iCloud 邮箱（本系统）` 直接使用当前模块创建邮箱和取码，不需要填写 API Base、API Key 或域名；`iCloud API` 继续保留给独立部署的外部服务。已有 GPT 邮箱会显示绿色“GPT 已注册”标签，已有 Grok 邮箱会显示蓝色“Grok 已注册”标签；注册流程会按目标平台领取未标记邮箱，成功后写入对应标签，失败会释放该平台标签。
 
 定时创建按账号执行：新接口每个账号每小时最多 `20` 个，旧接口每个账号每小时最多 `5` 个；两种登录态都保存后每小时最多 `25` 个。每个账号累计达到 `750` 个后自动停止该账号，所有账号达到目标后定时器自动结束。控制台支持按选中账号启动定时创建，默认每 `60` 分钟执行一轮；邮箱卡片可直接查看或复制邮箱地址、单邮箱 API 及 `邮箱----API` 组合。
+
+## 内置 Captcha Solver
+
+本地打码源码已经并入主仓库的 `captcha-solver/`，包含 xAI 实页 `window.turnstile.render()`、callback token 采集和注册代理按请求透传修复。安装主项目后直接创建独立虚拟环境：
+
+```bash
+cd captcha-solver
+uv venv --python 3.13 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+macOS 使用 `deploy/launchd/com.chatgpt2api.captcha-solver.plist.example`，Ubuntu/Linux 使用 `deploy/systemd/captcha-solver.service.example`。两份模板都默认从 `<项目目录>/captcha-solver` 启动，详细步骤见 macOS/Ubuntu 新手手册。
 
 ## 系统结构
 
@@ -90,6 +103,8 @@ curl https://pro.muyuai.top/v1/chat/completions \
 
 ## Docker 部署
 
+第一次搭建并需要本地 Captcha Solver 时，请选择对应手册：[macOS 从零搭建](docs/BEGINNER_LOCAL_SETUP.md) / [Ubuntu/Linux 从零搭建](docs/BEGINNER_UBUNTU_SETUP.md)。注册成功后需要自动投递外部账号池时，请阅读 [自动上传到 NovaApi（Sub2API）与 CPA](docs/AUTO_UPLOAD_SUB2API_CPA.md)。
+
 ### 环境要求
 
 - Docker Engine 24+
@@ -99,10 +114,10 @@ curl https://pro.muyuai.top/v1/chat/completions \
 
 ### 克隆项目
 
-仓库当前为私有仓库，需要使用已授权的 GitHub SSH Key：
+仓库已经公开，直接使用 HTTPS 克隆，不需要 GitHub Token 或 SSH Key：
 
 ```bash
-git clone git@github.com:AuuCoder/gptGrok2api.git
+git clone https://github.com/AuuCoder/gptGrok2api.git
 cd gptGrok2api
 ```
 
@@ -190,7 +205,9 @@ docker compose \
 nginx -t
 ```
 
-## Sub2API 对接
+## NovaApi / Sub2API 对接
+
+注册中心的自动同步以项目作者魔改版 [AuuCoder/NovaApi](https://github.com/AuuCoder/NovaApi) 为兼容目标。普通 Sub2API 上游可能缺少 xAI OAuth 账号类型或对应管理接口；部署时还要确认实际镜像不是默认的 `weishaw/sub2api:latest`。完整部署、连接和自动投递步骤见 [NovaApi 与 CPA 配置手册](docs/AUTO_UPLOAD_SUB2API_CPA.md)。
 
 当前服务器部署与 Sub2API 共用 `deploy_sub2api-network`。
 

@@ -74,6 +74,7 @@ export const registerTargetOptions = [
 export const turnstileProviderOptions = [
   { value: 'yescaptcha', label: 'YesCaptcha' },
   { value: '2captcha', label: '2Captcha' },
+  { value: 'local', label: '本地 Captcha Solver' },
   { value: 'custom', label: '自定义' },
 ] as const
 
@@ -233,7 +234,7 @@ export function normalizeRegisterTarget(value: unknown): RegisterTarget {
 
 export function normalizeTurnstileProvider(value: unknown): GrokTurnstileProvider {
   const provider = String(value || '').trim().toLowerCase()
-  return ['yescaptcha', '2captcha', 'custom'].includes(provider)
+  return ['yescaptcha', '2captcha', 'local', 'custom'].includes(provider)
     ? provider as GrokTurnstileProvider
     : 'yescaptcha'
 }
@@ -301,6 +302,7 @@ export function providerForRegisterTarget(provider: RegisterProvider, target: Re
 export function turnstileApiBasePlaceholder(provider: unknown) {
   if (normalizeTurnstileProvider(provider) === 'yescaptcha') return 'https://api.yescaptcha.com'
   if (normalizeTurnstileProvider(provider) === '2captcha') return 'https://api.2captcha.com'
+  if (normalizeTurnstileProvider(provider) === 'local') return 'http://127.0.0.1:8877'
   return 'https://solver.example.com'
 }
 
@@ -665,7 +667,7 @@ export function grokRequirementMessages(config: LegacyRegisterConfig | null | un
   if (!config || normalizeRegisterTarget(config.target) !== 'grok') return []
   const grok = normalizeGrokRegisterConfig(config.grok)
   const missing: string[] = []
-  if (!isFilled(grok.api_key)) missing.push('Turnstile API Key')
+  if (grok.provider !== 'local' && !isFilled(grok.api_key)) missing.push('Turnstile API Key')
   if (grok.provider === 'custom' && !isFilled(grok.api_base)) missing.push('Turnstile API Base')
   const sub2api = grok.oauth_delivery.sub2api
   if (sub2api.enabled) {

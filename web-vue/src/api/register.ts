@@ -82,7 +82,7 @@ export type RegisterProvider = {
 
 export type RegisterTarget = 'openai' | 'grok'
 
-export type GrokTurnstileProvider = 'yescaptcha' | '2captcha' | 'custom'
+export type GrokTurnstileProvider = 'yescaptcha' | '2captcha' | 'local' | 'custom'
 
 export type GrokOAuthDeliveryConfig = {
   sub2api: OpenAISub2APISyncConfig

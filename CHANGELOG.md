@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
++ [新增] 将本地 Captcha Solver 源码并入主仓库 `captcha-solver/`，内置 xAI 实页 Turnstile callback token 采集和注册代理按请求透传，不再依赖第二个仓库。
++ [新增] Grok 注册中心增加“本地 Captcha Solver” provider，并提供 macOS launchd、Ubuntu systemd 开机自启模板。
++ [文档] 新增 macOS、Ubuntu/Linux 从零部署手册，以及作者魔改 NovaApi（Sub2API）与 CPA 自动投递配置手册；明确发布者本机数据不进入公开仓库。
+
 ## 1.0.3 - 2026-07-18
 
 + [修复] 更新中心的最新版本与更新日志统一从 GitHub Releases 和仓库读取，不再依赖独立更新服务器，手动检查会强制刷新 GitHub 缓存。

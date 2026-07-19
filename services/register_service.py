@@ -399,7 +399,11 @@ def _normalize(raw: dict) -> dict:
     grok["max_mail_retries"] = max(1, min(20, int(retry_value or 3)))
     grok.pop("max_mail_retry", None)
     grok_provider = str(grok.get("provider") or "yescaptcha").strip().lower()
-    grok["provider"] = grok_provider if grok_provider in {"yescaptcha", "2captcha", "custom"} else "yescaptcha"
+    grok["provider"] = (
+        grok_provider
+        if grok_provider in {"yescaptcha", "2captcha", "local", "custom"}
+        else "yescaptcha"
+    )
     for key in (
         "api_key",
         "api_base",

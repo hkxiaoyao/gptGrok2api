@@ -564,6 +564,51 @@ class FlightTest(unittest.TestCase):
 
 
 class TurnstileSolverTest(unittest.TestCase):
+    def test_local_solver_calls_solve_endpoint_without_api_key(self) -> None:
+        calls: list[tuple[str, dict, dict]] = []
+
+        def transport(url: str, payload: dict, headers: dict) -> dict:
+            calls.append((url, payload, headers))
+            return {"solved": True, "token": "local-turnstile-token"}
+
+        solver = grok_protocol.TurnstileSolver(
+            {
+                "provider": "local",
+                "api_base": "http://127.0.0.1:8877/",
+                "proxy": "http://proxy.example.test:8080",
+                "captcha_timeout": 90,
+            },
+            transport=transport,
+        )
+        self.addCleanup(solver.close)
+
+        token = solver.solve(
+            website_url="https://accounts.x.ai/sign-up?redirect=grok-com",
+            sitekey="0x4AAAA-test",
+            action="signup",
+        )
+
+        self.assertEqual(token, "local-turnstile-token")
+        self.assertEqual(calls[0][0], "http://127.0.0.1:8877/solve")
+        self.assertEqual(calls[0][1]["type"], "turnstile")
+        self.assertEqual(calls[0][1]["action"], "signup")
+        self.assertIs(calls[0][1]["real_page"], True)
+        self.assertEqual(calls[0][1]["proxy"], "http://proxy.example.test:8080")
+        self.assertNotIn("Authorization", calls[0][2])
+
+    def test_local_solver_reports_unsolved_response(self) -> None:
+        solver = grok_protocol.TurnstileSolver(
+            {"provider": "local"},
+            transport=lambda _url, _payload, _headers: {
+                "solved": False,
+                "error": "Token not received",
+            },
+        )
+        self.addCleanup(solver.close)
+
+        with self.assertRaisesRegex(grok_protocol.GrokProtocolError, "Token not received"):
+            solver.solve(website_url="https://accounts.x.ai/sign-up", sitekey="0x-test")
+
     def test_yescaptcha_json_task_flow(self) -> None:
         calls: list[tuple[str, dict, dict]] = []
         responses = iter(

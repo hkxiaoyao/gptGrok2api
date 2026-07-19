@@ -786,8 +786,16 @@ class TurnstileSolver:
         ).strip()
         return create_path if create_path.startswith("/") else f"/{create_path}", result_path if result_path.startswith("/") else f"/{result_path}"
 
-    def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         headers = {str(key): str(value) for key, value in (self.config.get("custom_headers") or {}).items()}
+        if self.provider == "local" and self.api_key and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if self.transport is not None:
             data = self.transport(url, payload, headers)
             if not isinstance(data, dict):
@@ -797,7 +805,7 @@ class TurnstileSolver:
             url,
             json=payload,
             headers=headers or None,
-            timeout=self.request_timeout,
+            timeout=timeout or self.request_timeout,
         )
         try:
             data = response.json()
@@ -811,7 +819,8 @@ class TurnstileSolver:
             raise GrokProtocolError("Turnstile provider 返回结构不是对象", stage="captcha")
         if not 200 <= response.status_code < 300:
             raise GrokProtocolError(
-                f"Turnstile provider HTTP {response.status_code}: {data.get('errorDescription') or data.get('error') or ''}",
+                f"Turnstile provider HTTP {response.status_code}: "
+                f"{data.get('errorDescription') or data.get('error') or data.get('detail') or ''}",
                 stage="captcha",
                 retryable=response.status_code >= 500,
             )
@@ -825,6 +834,35 @@ class TurnstileSolver:
         return str(data.get("error") or "").strip()
 
     def solve(self, *, website_url: str, sitekey: str, action: str = "") -> str:
+        if self.provider == "local":
+            base_url = str(self.config.get("api_base") or "http://127.0.0.1:8877").strip().rstrip("/")
+            payload: dict[str, Any] = {
+                "type": "turnstile",
+                "url": website_url,
+                "sitekey": sitekey,
+                "real_page": bool(self.config.get("local_real_page", True)),
+                "timeout_s": max(10, int(self.timeout)),
+            }
+            if action:
+                payload["action"] = action
+            proxy = str(self.config.get("proxy") or "").strip()
+            if proxy and proxy.lower() != "direct":
+                payload["proxy"] = proxy
+            result = self._post(
+                f"{base_url}/solve",
+                payload,
+                timeout=max(self.request_timeout, self.timeout + 5),
+            )
+            token = str(result.get("token") or "").strip()
+            if result.get("solved") is True and token:
+                return token
+            error = str(result.get("error") or result.get("detail") or "").strip()
+            raise GrokProtocolError(
+                f"本地 Turnstile 求解失败: {error or '未返回 token'}",
+                stage="captcha",
+                retryable=True,
+            )
+
         if not self.api_key:
             raise GrokProtocolError("Grok 注册缺少 Turnstile API Key", stage="captcha")
         base_url = self._base_url()
@@ -1139,7 +1177,10 @@ class GrokProtocolClient:
 
     def solve_turnstile(self) -> str:
         metadata = self._metadata()
-        solver = TurnstileSolver(self.config)
+        solver_config = dict(self.config)
+        if self.proxy and self.proxy.lower() != "direct":
+            solver_config["proxy"] = self.proxy
+        solver = TurnstileSolver(solver_config)
         try:
             return solver.solve(
                 website_url=metadata.signup_url,
