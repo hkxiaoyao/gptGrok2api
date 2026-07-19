@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.0.4 - 2026-07-19
 
-+ [新增] 将本地 Captcha Solver 源码并入主仓库 `captcha-solver/`，内置 xAI 实页 Turnstile callback token 采集和注册代理按请求透传，不再依赖第二个仓库。
-+ [新增] Grok 注册中心增加“本地 Captcha Solver” provider，并提供 macOS launchd、Ubuntu systemd 开机自启模板。
-+ [文档] 新增 macOS、Ubuntu/Linux 从零部署手册、作者魔改 NovaApi（Sub2API）与 CPA 自动投递配置手册和日志错误示例；明确发布者本机数据不进入公开仓库。
++ [新增] 将本地 Captcha Solver 完整源码并入主仓库 `captcha-solver/`，安装 GPTGrok2API 后不再需要额外克隆 `xai-grok-mass`。
++ [新增] Grok 注册中心增加“本地 Captcha Solver” provider，默认连接 `http://127.0.0.1:8877`，无需第三方打码 API Key。
++ [修复] xAI 实页 Turnstile 使用 `window.turnstile.render()` 和 callback 采集 token，避免只注入 DOM 占位节点时拿不到可验证 token。
++ [修复] 注册任务将当前代理按请求透传给 solver，使浏览器解题与账号创建保持同一出口 IP。
++ [新增] 提供 macOS launchd 和 Ubuntu systemd 服务模板，统一从主项目内的 `captcha-solver/` 启动，并支持 Xvfb、多 worker、日志和开机自启。
++ [文档] 新增 macOS、Ubuntu/Linux 从零部署手册，明确公开仓库使用者只需克隆一个主仓库，本机 `.env`、账号数据、虚拟环境和日志不得上传。
++ [文档] 新增作者魔改 NovaApi（Sub2API）与 CPA 自动投递配置，覆盖 OpenAI/Grok 投递链路、分组、认证、验收和升级。
++ [文档] 新增日志错误示例与排查手册，并在 README 增加部署、自动投递、solver 和排错文档入口。
 
 ## 1.0.3 - 2026-07-18
 
