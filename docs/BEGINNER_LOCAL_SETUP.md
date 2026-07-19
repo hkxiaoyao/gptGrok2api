@@ -614,6 +614,8 @@ docker logs -f chatgpt2api-icloud-privacy-mail
 
 ## 18. 常见错误对照表
 
+更多完整日志片段、判断依据和 NovaApi/CPA 投递错误见 [日志错误示例与排查手册](TROUBLESHOOTING_LOG_EXAMPLES.md)。
+
 ### 18.1 `Grok Castle 运行需要 Node.js`
 
 原因：

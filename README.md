@@ -101,9 +101,22 @@ curl https://pro.muyuai.top/v1/chat/completions \
   }'
 ```
 
-## Docker 部署
+## 部署与排错文档
 
-第一次搭建并需要本地 Captcha Solver 时，请选择对应手册：[macOS 从零搭建](docs/BEGINNER_LOCAL_SETUP.md) / [Ubuntu/Linux 从零搭建](docs/BEGINNER_UBUNTU_SETUP.md)。注册成功后需要自动投递外部账号池时，请阅读 [自动上传到 NovaApi（Sub2API）与 CPA](docs/AUTO_UPLOAD_SUB2API_CPA.md)。
+| 文档 | 适用场景 |
+| --- | --- |
+| [macOS 从零搭建](docs/BEGINNER_LOCAL_SETUP.md) | Mac 本地混合部署、launchd、本地 solver 与日常维护 |
+| [Ubuntu/Linux 从零搭建](docs/BEGINNER_UBUNTU_SETUP.md) | Ubuntu 22.04/24.04、systemd、Xvfb、Nginx 与防火墙 |
+| [NovaApi（Sub2API）与 CPA 自动上传](docs/AUTO_UPLOAD_SUB2API_CPA.md) | OpenAI/Grok 注册成功后的远程账号投递 |
+| [日志错误示例与排查](docs/TROUBLESHOOTING_LOG_EXAMPLES.md) | Node、邮箱、Turnstile、solver、NovaApi、CPA 常见错误日志 |
+| [内置 Captcha Solver 说明](captcha-solver/README.md) | Solver API、环境变量、支持类型和底层运行方式 |
+
+服务模板：
+
+- macOS：[主程序 LaunchAgent](deploy/launchd/com.chatgpt2api.app.plist.example) / [Captcha Solver LaunchAgent](deploy/launchd/com.chatgpt2api.captcha-solver.plist.example)
+- Ubuntu：[主程序 systemd unit](deploy/systemd/chatgpt2api.service.example) / [Captcha Solver systemd unit](deploy/systemd/captcha-solver.service.example)
+
+## Docker 部署
 
 ### 环境要求
 

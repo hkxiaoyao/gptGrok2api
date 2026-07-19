@@ -728,6 +728,8 @@ curl https://api.example.com/v1/chat/completions \
 
 ## 22. 常见错误
 
+更多完整日志片段、判断依据和 NovaApi/CPA 投递错误见 [日志错误示例与排查手册](TROUBLESHOOTING_LOG_EXAMPLES.md)。
+
 ### 22.1 `Grok Castle 运行需要 Node.js`
 
 ```bash

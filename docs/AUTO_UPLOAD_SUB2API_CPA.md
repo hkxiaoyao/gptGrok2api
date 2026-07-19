@@ -333,6 +333,8 @@ unset CPA_KEY
 
 ## 9. 常见问题
 
+需要结合主程序、solver、NovaApi 和 CPA 的实际日志判断时，请同时阅读 [日志错误示例与排查手册](TROUBLESHOOTING_LOG_EXAMPLES.md)。
+
 ### 9.1 NovaApi 返回 401/403
 
 检查：
