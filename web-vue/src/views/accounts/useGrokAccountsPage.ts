@@ -36,6 +36,8 @@ export const grokAccountStatusFilterOptions = [
   { label: '运行正常', value: 'normal' },
   { label: '运行限流', value: 'limited' },
   { label: '刷新失败', value: 'refresh_failed' },
+  { label: '探测失效', value: 'probe_invalid' },
+  { label: '探测未知', value: 'probe_unknown' },
   { label: '运行异常', value: 'abnormal' },
   { label: '运行禁用', value: 'disabled' },
 ] as const satisfies ReadonlyArray<{ label: string; value: GrokAccountStatusFilter }>

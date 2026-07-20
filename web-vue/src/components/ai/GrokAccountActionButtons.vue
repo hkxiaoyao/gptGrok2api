@@ -3,16 +3,16 @@
     <Button
       size="xs"
       variant="outline"
-      root-class="w-14 justify-center"
+      root-class="w-16 justify-center whitespace-nowrap"
       :disabled="busy || !item.has_sso || !runtimeAvailable || syncing || chatting"
       @click="emit('sync')"
     >
-      {{ syncing ? '加入中' : (item.sync_state === 'synced' ? '重新加入' : '加入') }}
+      {{ syncing ? '加入中' : (item.sync_state === 'synced' ? '重加' : '加入') }}
     </Button>
     <Button
       size="xs"
       variant="outline"
-      root-class="w-14 justify-center"
+      root-class="w-16 justify-center whitespace-nowrap"
       :disabled="busy || !item.has_sso || testing || chatting"
       @click="emit('test')"
     >
@@ -21,7 +21,7 @@
     <Button
       size="xs"
       variant="outline"
-      root-class="w-14 justify-center"
+      root-class="w-16 justify-center whitespace-nowrap"
       :disabled="busy || !item.has_sso || chatting"
       @click="emit('chat')"
     >

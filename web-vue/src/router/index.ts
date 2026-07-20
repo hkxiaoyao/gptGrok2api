@@ -34,7 +34,7 @@ const router = createRouter({
         {
           path: 'grok-runtime',
           name: 'grok-runtime',
-          component: () => import('@/views/GrokRuntime.vue'),
+          redirect: { name: 'accounts', query: { platform: 'grok' } },
           meta: { adminOnly: true },
         },
         {

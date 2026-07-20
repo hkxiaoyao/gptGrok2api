@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
-import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import services.register_service as register_service_module
 from app.platform.errors import UpstreamError
 from services.register.grok_account_store import GrokAccountStore
-from services.register_service import GrokAccountChatTestError, RegisterService, _normalize
+from services.register_service import GrokAccountChatTestError, RegisterService, _grok_oauth_display_status, _normalize
 from services.xai_cli_oauth_store import XaiCliOAuthAccountStore
 
 
@@ -90,6 +91,19 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
         self.assertEqual(defaults["grok2api_pool"], "auto")
         self.assertTrue(defaults["grok2api_verify_on_import"])
         self.assertEqual(defaults["grok2api_timeout"], 30)
+        self.assertEqual(
+            defaults["probe_scheduler"],
+            {
+                "interval_minutes": 60,
+                "batch_size": 50,
+                "last_started_at": "",
+                "last_finished_at": "",
+                "oauth_recovery_last_sweep_at": "",
+                "last_result": {},
+                "last_error": "",
+                "events": [],
+            },
+        )
         self.assertTrue(nested["grok2api_enabled"])
         self.assertEqual(nested["grok2api_api_base"], "")
         self.assertEqual(nested["grok2api_admin_key"], "")
@@ -101,6 +115,37 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             _normalize({"target": "grok", "grok": {"grok2api_pool": "unknown"}})["grok"]["grok2api_pool"],
             "auto",
         )
+
+    def test_grok_oauth_display_status_matches_account_table(self) -> None:
+        self.assertEqual(_grok_oauth_display_status(None), "unauthorized")
+        self.assertEqual(_grok_oauth_display_status({"status": "active"}), "normal")
+        self.assertEqual(
+            _grok_oauth_display_status({"status": "active", "probe": {"status": "limited"}}),
+            "limited",
+        )
+        self.assertEqual(
+            _grok_oauth_display_status({"status": "expired", "probe": {"status": "valid"}}),
+            "expired",
+        )
+        self.assertEqual(
+            _grok_oauth_display_status({"status": "invalid", "probe": {"status": "valid"}}),
+            "invalid",
+        )
+
+    def test_grok_probe_scheduler_runs_in_background_even_with_legacy_disabled_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(
+                temp_dir,
+                probe_scheduler={"enabled": False, "interval_minutes": 15, "batch_size": 25},
+            )
+
+            status = service.grok_probe_scheduler_status()
+
+            self.assertNotIn("enabled", status)
+            self.assertNotIn("queued", status)
+            self.assertEqual(status["interval_minutes"], 15)
+            self.assertEqual(status["batch_size"], 25)
+            self.assertTrue(status["next_run_at"])
 
     def test_chat_test_resolves_one_id_and_redacts_console_permission_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -181,165 +226,6 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 409)
             self.assertIn("Console 对话额度已耗尽", str(raised.exception))
             client.chat_test.assert_not_called()
-
-    def test_batch_chat_test_classifies_results_without_leaking_ssos(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
-            success = store.upsert({"email": "success@example.com", "sso": "success-sso", "status": "active"})
-            limited = store.upsert({"email": "limited@example.com", "sso": "limited-sso", "status": "active"})
-            upstream_limited = store.upsert({"email": "upstream-limited@example.com", "sso": "upstream-limited-sso", "status": "active"})
-            blocked = store.upsert({"email": "blocked@example.com", "sso": "blocked-sso", "status": "active"})
-            invalid = store.upsert({"email": "invalid@example.com", "sso": "invalid-sso", "status": "active"})
-            permission = store.upsert({"email": "permission@example.com", "sso": "permission-sso", "status": "active"})
-            failed = store.upsert({"email": "failed@example.com", "sso": "failed-sso", "status": "active"})
-            after_failed = store.upsert({"email": "after-failed@example.com", "sso": "after-failed-sso", "status": "active"})
-            skipped = store.upsert({"email": "skipped@example.com", "sso": "", "status": "pending_sso"})
-            store.reconcile_runtime_accounts(
-                [
-                    {
-                        "token": "limited-sso",
-                        "status": "active",
-                        "pool": "basic",
-                        "quota": {
-                            "console": {
-                                "remaining": 0,
-                                "total": 20,
-                                "reset_at": 9_999_999_999_999,
-                                "source": 2,
-                            }
-                        },
-                    }
-                ]
-            )
-            service = self._service(temp_dir)
-            client = FakeGrok2APIClient()
-
-            def chat_test(token: str, **_kwargs):
-                if token in {"success-sso", "after-failed-sso"}:
-                    return {"model": "grok-4.3-console", "content": "pong", "elapsed_ms": 8}
-                if token == "upstream-limited-sso":
-                    raise UpstreamError("Console API returned 429 upstream-limited-sso", status=429)
-                if token == "blocked-sso":
-                    raise UpstreamError("Console API returned 403 blocked-sso", status=403, body="account suspended blocked-sso")
-                if token == "invalid-sso":
-                    raise UpstreamError("Console API returned 401 invalid-sso", status=401, body="session not found invalid-sso")
-                if token == "permission-sso":
-                    raise UpstreamError("Console API returned 403 permission-sso", status=403, body="permission-denied")
-                raise RuntimeError(f"unexpected {token}")
-
-            client.chat_test.side_effect = chat_test
-            with patch.object(register_service_module, "grok_account_store", store), patch.object(
-                service, "_grok2api_client", return_value=client
-            ):
-                started = service.start_grok_accounts_chat_test_job(prompt="ping")
-                job_id = started["job"]["id"]
-                deadline = time.monotonic() + 2
-                result = service.get_grok_accounts_chat_test_job(job_id)
-                while result is not None and result["status"] in {"queued", "running"} and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                    result = service.get_grok_accounts_chat_test_job(job_id)
-
-            self.assertIsNotNone(result)
-            self.assertEqual(result["status"], "completed")
-            self.assertEqual(
-                result["summary"],
-                {
-                    "total": 9,
-                    "success": 2,
-                    "blocked": 1,
-                    "invalid": 1,
-                    "limited": 2,
-                    "permission": 1,
-                    "failed": 1,
-                    "skipped": 1,
-                    "pending": 0,
-                },
-            )
-            by_id = {item["id"]: item for item in result["results"]}
-            self.assertEqual(by_id[success["item"]["id"]]["status"], "success")
-            self.assertEqual(by_id[limited["item"]["id"]]["status"], "limited")
-            self.assertEqual(by_id[upstream_limited["item"]["id"]]["status"], "limited")
-            self.assertEqual(by_id[blocked["item"]["id"]]["status"], "blocked")
-            self.assertEqual(by_id[invalid["item"]["id"]]["status"], "invalid")
-            self.assertEqual(by_id[permission["item"]["id"]]["status"], "permission")
-            self.assertEqual(by_id[failed["item"]["id"]]["status"], "failed")
-            self.assertEqual(by_id[after_failed["item"]["id"]]["status"], "success")
-            self.assertEqual(by_id[skipped["item"]["id"]]["status"], "skipped")
-            self.assertEqual(by_id[success["item"]["id"]]["elapsed_ms"], 8)
-            self.assertEqual(by_id[limited["item"]["id"]]["elapsed_ms"], 0)
-            self.assertEqual(client.chat_test.call_count, 7)
-            encoded = json.dumps(result, ensure_ascii=False)
-            for secret in (
-                "success-sso",
-                "limited-sso",
-                "upstream-limited-sso",
-                "blocked-sso",
-                "invalid-sso",
-                "permission-sso",
-                "failed-sso",
-                "after-failed-sso",
-            ):
-                self.assertNotIn(secret, encoded)
-
-    def test_batch_chat_test_job_reuses_active_job_and_cancels_remaining_accounts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
-            first = store.upsert({"email": "first@example.com", "sso": "first-sso", "status": "active"})
-            second = store.upsert({"email": "second@example.com", "sso": "second-sso", "status": "active"})
-            skipped = store.upsert({"email": "skipped@example.com", "sso": "", "status": "pending_sso"})
-            service = self._service(temp_dir)
-            entered = threading.Event()
-            release = threading.Event()
-
-            def chat_test(account_id: str, **_kwargs):
-                entered.set()
-                release.wait(timeout=2)
-                return {"id": account_id, "model": "grok-4.3-console", "content": "pong", "elapsed_ms": 7}
-
-            with patch.object(register_service_module, "grok_account_store", store), patch.object(
-                service,
-                "chat_test_grok_account",
-                side_effect=chat_test,
-            ) as single_test:
-                started = service.start_grok_accounts_chat_test_job(prompt="ping")
-                job_id = started["job"]["id"]
-                self.assertTrue(entered.wait(timeout=1))
-
-                attached = service.start_grok_accounts_chat_test_job(prompt="different prompt")
-                self.assertTrue(attached["reused"])
-                self.assertEqual(attached["job"]["id"], job_id)
-                self.assertEqual(attached["job"]["status"], "running")
-
-                cancelling = service.cancel_grok_accounts_chat_test_job(job_id)
-                self.assertIsNotNone(cancelling)
-                self.assertTrue(cancelling["cancel_requested"])
-                release.set()
-
-                deadline = time.monotonic() + 2
-                result = service.get_grok_accounts_chat_test_job(job_id)
-                while result is not None and result["status"] in {"queued", "running"} and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                    result = service.get_grok_accounts_chat_test_job(job_id)
-
-            self.assertIsNotNone(result)
-            self.assertEqual(result["status"], "cancelled")
-            self.assertEqual(result["summary"], {
-                "total": 3,
-                "success": 1,
-                "blocked": 0,
-                "invalid": 0,
-                "limited": 0,
-                "permission": 0,
-                "failed": 0,
-                "skipped": 2,
-                "pending": 0,
-            })
-            by_id = {item["id"]: item for item in result["results"]}
-            self.assertEqual(by_id[first["item"]["id"]]["status"], "success")
-            self.assertEqual(by_id[second["item"]["id"]]["status"], "skipped")
-            self.assertEqual(by_id[second["item"]["id"]]["error"], "任务已取消")
-            self.assertEqual(by_id[skipped["item"]["id"]]["status"], "skipped")
-            single_test.assert_called_once_with(first["item"]["id"], prompt="ping", model="grok-4.3-console")
 
     def test_active_account_auto_imports_verifies_and_deduplicates_locally(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -495,6 +381,9 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             saved = store.upsert(
                 {"email": "oauth-user@example.com", "password": "password", "sso": "sso-secret", "status": "active"}
             )
+            store.upsert(
+                {"email": "no-oauth@example.com", "password": "password", "sso": "other-sso-secret", "status": "active"}
+            )
             oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "xai_cli_oauth_accounts.json")
             linked = oauth_store.upsert(
                 {
@@ -526,6 +415,10 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             self.assertEqual(item["oauth"]["models"], ["grok-4.5"])
             self.assertEqual(view["summary"]["oauth_total"], 2)
             self.assertEqual(view["summary"]["oauth_linked"], 1)
+            self.assertEqual(
+                view["summary"]["oauth_status"],
+                {"unauthorized": 1, "normal": 1, "limited": 0, "expired": 0, "invalid": 0},
+            )
             encoded = json.dumps(view, ensure_ascii=False)
             self.assertNotIn("oauth-access-secret", encoded)
             self.assertNotIn("oauth-refresh-secret", encoded)
@@ -639,6 +532,608 @@ class RegisterServiceGrok2APITest(unittest.TestCase):
             self.assertEqual(result["summary"], {"total": 1, "valid": 0, "invalid": 0, "unknown": 1})
             self.assertEqual(result["results"][0]["status"], "unknown")
             self.assertNotIn("transient-secret", json.dumps(result, ensure_ascii=False))
+
+    def test_scheduled_probe_checks_only_synced_non_disabled_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            active = store.upsert(
+                {"email": "active@example.com", "password": "password", "sso": "active-secret", "status": "active"}
+            )
+            disabled = store.upsert(
+                {"email": "disabled@example.com", "password": "password", "sso": "disabled-secret", "status": "active"}
+            )
+            local_only = store.upsert(
+                {"email": "local@example.com", "password": "password", "sso": "local-secret", "status": "active"}
+            )
+            service = self._service(
+                temp_dir,
+                probe_scheduler={"interval_minutes": 15, "batch_size": 1},
+            )
+            client = FakeGrok2APIClient()
+            client.list_result = {
+                "tokens": [
+                    {"token": "active-secret", "status": "active", "pool": "auto"},
+                    {"token": "disabled-secret", "status": "disabled", "pool": "auto"},
+                ]
+            }
+            client.verify_result = {
+                "results": [
+                    {
+                        "token": "active-secret",
+                        "status": "valid",
+                        "quota": {"remaining": 7, "total": 10},
+                    }
+                ]
+            }
+
+            with patch.object(register_service_module, "grok_account_store", store), patch.object(
+                service, "_grok2api_client", return_value=client
+            ):
+                summary = service._run_grok_probe_once()
+                status = service.grok_probe_scheduler_status()
+
+            self.assertEqual(
+                summary,
+                {
+                    "eligible": 1,
+                    "skipped": 2,
+                    "total": 1,
+                    "valid": 1,
+                    "invalid": 0,
+                    "unknown": 0,
+                    "batches": 1,
+                    "recovery_attempted": 0,
+                    "recovery_succeeded": 0,
+                    "recovery_failed": 0,
+                    "recovery_deferred": 0,
+                    "oauth_eligible": 0,
+                    "oauth_skipped": 0,
+                    "oauth_total": 0,
+                    "oauth_valid": 0,
+                    "oauth_limited": 0,
+                    "oauth_invalid": 0,
+                    "oauth_unknown": 0,
+                    "oauth_batches": 0,
+                    "oauth_recovery_attempted": 0,
+                    "oauth_recovery_queued": 0,
+                    "oauth_recovery_failed": 0,
+                    "oauth_recovery_deferred": 0,
+                    "oauth_backfill_eligible": 0,
+                    "oauth_backfill_attempted": 0,
+                    "oauth_backfill_queued": 0,
+                    "oauth_backfill_reused": 0,
+                    "oauth_backfill_failed": 0,
+                    "oauth_backfill_deferred": 0,
+                    "oauth_backfill_missing_credentials": 0,
+                },
+            )
+            client.verify.assert_called_once_with(["active-secret"])
+            active_item = store.get_accounts_by_ids([active["item"]["id"]])[0]
+            self.assertEqual(active_item["probe"]["status"], "valid")
+            self.assertEqual(active_item["probe"]["quota"], {"remaining": 7, "total": 10})
+            self.assertNotIn("probe", store.get_accounts_by_ids([disabled["item"]["id"]])[0])
+            self.assertNotIn("probe", store.get_accounts_by_ids([local_only["item"]["id"]])[0])
+            self.assertEqual(status["last_result"], summary)
+            self.assertFalse(status["running"])
+            self.assertTrue(status["next_run_at"])
+            self.assertIn("Grok 账号探测完成", status["events"][-1]["message"])
+
+    def test_scheduled_probe_checks_oauth_with_grok_45_and_persists_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            active = oauth_store.upsert(
+                {
+                    "email": "oauth@example.com",
+                    "subject": "oauth-subject",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh",
+                    "expires_in": 3600,
+                    "models": ["grok-4.5"],
+                }
+            )["item"]
+            disabled = oauth_store.upsert(
+                {
+                    "email": "disabled@example.com",
+                    "subject": "disabled-subject",
+                    "access_token": "disabled-access",
+                    "refresh_token": "disabled-refresh",
+                    "expires_in": 3600,
+                    "models": ["grok-4.5"],
+                }
+            )["item"]
+            oauth_store.set_disabled(disabled["id"], True)
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            service = self._service(temp_dir, probe_scheduler={"interval_minutes": 15, "batch_size": 50})
+            client = FakeGrok2APIClient()
+            upstream = httpx.Response(
+                200,
+                headers={
+                    "x-ratelimit-limit-requests": "21",
+                    "x-ratelimit-remaining-requests": "20",
+                    "x-ratelimit-limit-tokens": "1000000",
+                    "x-ratelimit-remaining-tokens": "999900",
+                },
+                json={"usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}},
+            )
+
+            with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
+                register_service_module, "xai_cli_oauth_store", oauth_store
+            ), patch.object(service, "_grok2api_client", return_value=client), patch(
+                "services.xai_cli_oauth_service.XaiCliOAuthService._post_response",
+                new=AsyncMock(return_value=upstream),
+            ):
+                summary = service._run_grok_probe_once()
+
+            self.assertEqual(summary["oauth_eligible"], 1)
+            self.assertEqual(summary["oauth_skipped"], 1)
+            self.assertEqual(summary["oauth_valid"], 1)
+            self.assertEqual(summary["oauth_batches"], 1)
+            saved = oauth_store.get(active["id"], redacted=True)
+            self.assertEqual(saved["probe"]["status"], "valid")
+            self.assertEqual(saved["probe"]["model"], "grok-4.5")
+            self.assertEqual(saved["quota"]["requests"]["remaining"], 20)
+            self.assertEqual(saved["use_count"], 0)
+            self.assertEqual(oauth_store.get(disabled["id"], redacted=True)["probe"], {})
+
+    def test_scheduled_probe_queues_invalid_oauth_reauthorization_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            oauth = oauth_store.upsert(
+                {
+                    "email": "recover@example.com",
+                    "subject": "recover-subject",
+                    "access_token": "recover-access",
+                    "refresh_token": "recover-refresh",
+                    "expires_in": 3600,
+                    "models": ["grok-4.5"],
+                }
+            )["item"]
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            source = grok_store.upsert(
+                {"email": "recover@example.com", "password": "saved-password", "status": "active"}
+            )["item"]
+            service = self._service(temp_dir, probe_scheduler={"interval_minutes": 15, "batch_size": 50})
+            client = FakeGrok2APIClient()
+            protocol_sink = MagicMock(
+                return_value={"reused": False, "queued": True, "job": {"id": "oauth-recovery-job-one"}}
+            )
+            service._grok_oauth_protocol_sink = protocol_sink
+            blocked = httpx.Response(
+                402,
+                json={"error": {"code": "personal-team-blocked", "message": "Personal team is blocked"}},
+            )
+
+            with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
+                register_service_module, "xai_cli_oauth_store", oauth_store
+            ), patch.object(service, "_grok2api_client", return_value=client), patch(
+                "services.xai_cli_oauth_service.XaiCliOAuthService._post_response",
+                new=AsyncMock(return_value=blocked),
+            ):
+                first = service._run_grok_probe_once()
+                second = service._run_grok_probe_once()
+
+            self.assertEqual(first["oauth_invalid"], 1)
+            self.assertEqual(first["oauth_recovery_attempted"], 1)
+            self.assertEqual(first["oauth_recovery_queued"], 1)
+            self.assertEqual(second["oauth_recovery_attempted"], 0)
+            self.assertEqual(second["oauth_recovery_deferred"], 1)
+            protocol_sink.assert_called_once_with(source["id"], retry=True)
+            recovered = oauth_store.get(oauth["id"], redacted=True)
+            self.assertEqual(recovered["status"], "invalid")
+            self.assertEqual(recovered["recovery"]["status"], "pending")
+            self.assertEqual(recovered["recovery"]["job_id"], "oauth-recovery-job-one")
+            self.assertEqual(recovered["recovery"]["source_account_id"], source["id"])
+
+    def test_permission_retry_only_probes_accounts_after_delay_and_counts_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            old = oauth_store.upsert(
+                {
+                    "email": "old-pending@example.com",
+                    "subject": "old-pending-subject",
+                    "access_token": "old-pending-access",
+                    "refresh_token": "old-pending-refresh",
+                    "expires_in": 3600,
+                    "models": ["grok-4.5"],
+                }
+            )["item"]
+            recent = oauth_store.upsert(
+                {
+                    "email": "recent-pending@example.com",
+                    "subject": "recent-pending-subject",
+                    "access_token": "recent-pending-access",
+                    "refresh_token": "recent-pending-refresh",
+                    "expires_in": 3600,
+                    "models": ["grok-4.5"],
+                }
+            )["item"]
+            now = datetime.now(timezone.utc)
+            oauth_store.update_probe_result(
+                old["id"],
+                status="invalid",
+                model="grok-4.5",
+                http_status=403,
+                code="permission-denied",
+                error="permission pending",
+                probed_at=(now - timedelta(minutes=16)).isoformat(),
+            )
+            oauth_store.update_probe_result(
+                recent["id"],
+                status="invalid",
+                model="grok-4.5",
+                http_status=403,
+                code="permission-denied",
+                error="permission pending",
+                probed_at=(now - timedelta(minutes=14)).isoformat(),
+            )
+            service = self._service(temp_dir)
+            probe_accounts = AsyncMock(
+                return_value={
+                    "results": [
+                        {
+                            "account_id": old["id"],
+                            "status": "valid",
+                            "code": "",
+                            "delivery": {"sub2api": {"status": "success"}},
+                        }
+                    ],
+                    "summary": {"delivery_success": 1},
+                }
+            )
+
+            with patch.object(register_service_module, "xai_cli_oauth_store", oauth_store), patch(
+                "services.xai_cli_oauth_service.xai_cli_oauth_service.probe_accounts",
+                new=probe_accounts,
+            ):
+                summary = service._run_grok_permission_retry_once()
+
+            self.assertEqual(
+                summary,
+                {"eligible": 1, "tested": 1, "valid": 1, "pending": 0, "failed": 0, "uploaded": 1},
+            )
+            probe_accounts.assert_awaited_once_with([old["id"]], concurrency=3)
+            self.assertIn("恢复 1，待生效 0，其他失败 0，已上传 1", service.get()["logs"][-1]["text"])
+
+    def test_scheduler_drains_due_permission_batches_without_idle_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            stop_event = threading.Event()
+            calls = 0
+
+            def retry_batch(_stop_event: threading.Event) -> dict[str, int]:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    stop_event.set()
+                return {"tested": 3}
+
+            with patch.object(
+                service,
+                "_grok_oauth_recovery_sweep_due",
+                return_value=False,
+            ), patch.object(
+                service,
+                "_grok_oauth_has_inflight_recovery",
+                return_value=False,
+            ), patch.object(
+                service,
+                "_grok_oauth_has_unlinked_accounts",
+                return_value=False,
+            ), patch.object(
+                service,
+                "_run_grok_permission_retry_once",
+                side_effect=retry_batch,
+            ), patch.object(
+                service,
+                "_grok_probe_due_locked",
+                return_value=False,
+            ), patch.object(service._grok_probe_wake_event, "wait") as wait:
+                service._run_grok_probe_scheduler(stop_event)
+
+            self.assertEqual(calls, 2)
+            wait.assert_not_called()
+
+    def test_oauth_protocol_events_complete_or_backoff_automatic_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            oauth = oauth_store.upsert(
+                {
+                    "email": "recover@example.com",
+                    "subject": "recover-subject",
+                    "access_token": "recover-access",
+                    "refresh_token": "recover-refresh",
+                    "expires_in": 3600,
+                }
+            )["item"]
+            service = self._service(temp_dir)
+
+            with patch.object(register_service_module, "xai_cli_oauth_store", oauth_store):
+                oauth_store.update_recovery_state(
+                    oauth["id"],
+                    status="pending",
+                    job_id="success-job",
+                    last_attempt_at="2030-01-01T00:00:00+00:00",
+                    attempts=1,
+                )
+                service.handle_grok_oauth_protocol_event(
+                    {
+                        "status": "authorized",
+                        "job_id": "success-job",
+                        "email": "recover@example.com",
+                        "delivery": {
+                            "sub2api": {
+                                "status": "success",
+                                "target_id": "nova-one",
+                            }
+                        },
+                    }
+                )
+                successful = oauth_store.get(oauth["id"], redacted=True)
+                self.assertIn("自动恢复完成，已上传到 NovaApi", service.get()["logs"][-1]["text"])
+
+                oauth_store.update_recovery_state(
+                    oauth["id"],
+                    status="pending",
+                    job_id="failed-job",
+                    last_attempt_at="2030-01-02T00:00:00+00:00",
+                    attempts=2,
+                )
+                service.handle_grok_oauth_protocol_event(
+                    {
+                        "status": "failed",
+                        "job_id": "failed-job",
+                        "email": "recover@example.com",
+                        "error": "authorization failed",
+                    }
+                )
+                failed = oauth_store.get(oauth["id"], redacted=True)
+                self.assertEqual(len(service.get()["logs"]), 1)
+
+            self.assertEqual(successful["recovery"]["status"], "success")
+            self.assertTrue(successful["recovery"]["last_success_at"])
+            self.assertEqual(successful["recovery"]["attempts"], 0)
+            self.assertEqual(failed["recovery"]["status"], "failed")
+            self.assertTrue(failed["recovery"]["next_attempt_at"])
+            self.assertEqual(failed["recovery"]["attempts"], 2)
+
+    def test_permission_pending_event_is_not_reported_as_authorization_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+
+            service.handle_grok_oauth_protocol_event(
+                {
+                    "status": "permission_pending",
+                    "job_id": "permission-job",
+                    "email": "pending@example.com",
+                    "delivery": {},
+                }
+            )
+
+            self.assertIn("权限待生效，已进入延迟复检", service.get()["logs"][-1]["text"])
+
+    def test_startup_recovery_sweep_queues_unlinked_oauth_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            oauth_store.upsert(
+                {
+                    "email": "linked@example.com",
+                    "subject": "linked-subject",
+                    "access_token": "linked-access",
+                    "refresh_token": "linked-refresh",
+                    "expires_in": 3600,
+                }
+            )
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            grok_store.upsert(
+                {"email": "linked@example.com", "password": "linked-password", "status": "active"}
+            )
+            unlinked = grok_store.upsert(
+                {"email": "unlinked@example.com", "password": "saved-password", "status": "active"}
+            )["item"]
+            grok_store.upsert({"email": "missing-password@example.com", "status": "active"})
+            service = self._service(temp_dir)
+            sink = MagicMock(return_value={"queued": True, "job": {"id": "backfill-job"}})
+            service._grok_oauth_protocol_sink = sink
+
+            with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
+                register_service_module, "xai_cli_oauth_store", oauth_store
+            ):
+                self.assertTrue(service._grok_oauth_has_unlinked_accounts())
+                summary = service._run_grok_oauth_recovery_sweep(limit=50)
+
+            self.assertEqual(summary["backfill_eligible"], 1)
+            self.assertEqual(summary["backfill_attempted"], 1)
+            self.assertEqual(summary["backfill_queued"], 1)
+            self.assertEqual(summary["backfill_missing_credentials"], 1)
+            sink.assert_called_once_with(unlinked["id"])
+
+    def test_startup_recovery_sweep_queues_previously_detected_invalid_oauth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            oauth = oauth_store.upsert(
+                {
+                    "email": "startup@example.com",
+                    "subject": "startup-subject",
+                    "access_token": "startup-access",
+                    "refresh_token": "startup-refresh",
+                    "expires_in": 3600,
+                }
+            )["item"]
+            oauth_store.update_probe_result(
+                oauth["id"],
+                status="invalid",
+                model="grok-4.5",
+                http_status=402,
+                code="personal-team-blocked",
+            )
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            source = grok_store.upsert(
+                {"email": "startup@example.com", "password": "saved-password", "status": "active"}
+            )["item"]
+            service = self._service(temp_dir)
+            service._config["grok"]["probe_scheduler"]["last_finished_at"] = "2020-01-01T00:00:00+00:00"
+            sink = MagicMock(return_value={"queued": True, "job": {"id": "startup-recovery-job"}})
+            service._grok_oauth_protocol_sink = sink
+
+            with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
+                register_service_module, "xai_cli_oauth_store", oauth_store
+            ):
+                probe = service._grok_probe_config_locked()
+                self.assertTrue(service._grok_oauth_recovery_sweep_due(probe))
+                summary = service._run_grok_oauth_recovery_sweep(limit=50)
+
+            self.assertEqual(summary["eligible"], 1)
+            self.assertEqual(summary["queued"], 1)
+            sink.assert_called_once_with(source["id"], retry=True)
+            status = service.grok_probe_scheduler_status()
+            self.assertTrue(status["oauth_recovery_last_sweep_at"])
+            self.assertFalse(service._grok_oauth_recovery_sweep_due(status))
+            self.assertEqual(service.get()["logs"], [])
+
+    def test_startup_scheduler_reclaims_orphaned_pending_oauth_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oauth_store = XaiCliOAuthAccountStore(Path(temp_dir) / "oauth_accounts.json")
+            oauth = oauth_store.upsert(
+                {
+                    "email": "orphan@example.com",
+                    "subject": "orphan-subject",
+                    "access_token": "orphan-access",
+                    "refresh_token": "orphan-refresh",
+                    "expires_in": 3600,
+                }
+            )["item"]
+            oauth_store.update_probe_result(
+                oauth["id"],
+                status="invalid",
+                model="grok-4.5",
+                http_status=402,
+                code="personal-team-blocked",
+            )
+            oauth_store.update_recovery_state(
+                oauth["id"],
+                status="pending",
+                job_id="orphaned-job",
+                source_account_id="old-source-id",
+                last_attempt_at=register_service_module._now(),
+                attempts=1,
+            )
+            grok_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            source = grok_store.upsert(
+                {"email": "orphan@example.com", "password": "saved-password", "status": "active"}
+            )["item"]
+            service = self._service(temp_dir)
+            probe = service._config["grok"]["probe_scheduler"]
+            probe["last_finished_at"] = "2020-01-01T00:00:00+00:00"
+            probe["oauth_recovery_last_sweep_at"] = "2020-01-01T00:00:00+00:00"
+            stop_event = threading.Event()
+
+            def queue_replacement(_account_id: str, *, retry: bool = False) -> dict[str, object]:
+                self.assertTrue(retry)
+                stop_event.set()
+                return {"queued": True, "job": {"id": "replacement-job"}}
+
+            service._grok_oauth_protocol_sink = MagicMock(side_effect=queue_replacement)
+
+            with patch.object(register_service_module, "grok_account_store", grok_store), patch.object(
+                register_service_module, "xai_cli_oauth_store", oauth_store
+            ):
+                self.assertFalse(service._grok_oauth_recovery_sweep_due(probe))
+                service._run_grok_probe_scheduler(stop_event)
+
+            service._grok_oauth_protocol_sink.assert_called_once_with(source["id"], retry=True)
+            recovered = oauth_store.get(oauth["id"], redacted=True)
+            self.assertEqual(recovered["recovery"]["status"], "pending")
+            self.assertEqual(recovered["recovery"]["job_id"], "replacement-job")
+            self.assertEqual(recovered["recovery"]["attempts"], 2)
+            self.assertEqual(service.get()["logs"], [])
+
+    def test_scheduled_probe_recovers_invalid_account_with_saved_password(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            saved = store.upsert(
+                {"email": "user@example.com", "password": "password", "sso": "old-secret", "status": "active"}
+            )
+            service = self._service(temp_dir)
+            client = FakeGrok2APIClient()
+            client.list_result = {
+                "tokens": [{"token": "old-secret", "status": "active", "pool": "auto"}]
+            }
+            client.verify.side_effect = [
+                {"results": [{"token": "old-secret", "status": "invalid", "error": "expired"}]},
+                {
+                    "results": [
+                        {
+                            "token": "new-secret",
+                            "status": "valid",
+                            "quota": {"remaining": 9, "total": 10},
+                        }
+                    ]
+                },
+            ]
+
+            def delete_old(_tokens):
+                client.list_result = {
+                    "tokens": [{"token": "new-secret", "status": "active", "pool": "auto"}]
+                }
+                return {"deleted": 1}
+
+            client.delete.side_effect = delete_old
+
+            with patch.object(register_service_module, "grok_account_store", store), patch.object(
+                service, "_grok2api_client", return_value=client
+            ), patch.object(service, "_authorize_grok_recovery_sso", return_value="new-secret") as authorize:
+                summary = service._run_grok_probe_once()
+
+            self.assertEqual(summary["invalid"], 1)
+            self.assertEqual(summary["recovery_attempted"], 1)
+            self.assertEqual(summary["recovery_succeeded"], 1)
+            self.assertEqual(summary["recovery_failed"], 0)
+            authorize.assert_called_once_with(email="user@example.com", password="password")
+            client.add.assert_called_once_with(["new-secret"])
+            client.delete.assert_called_once_with(["old-secret"])
+            item = store.get_accounts_by_ids([saved["item"]["id"]])[0]
+            self.assertEqual(item["sso"], "new-secret")
+            self.assertEqual(item["probe"]["status"], "valid")
+            self.assertEqual(item["probe"]["quota"], {"remaining": 9, "total": 10})
+            self.assertEqual(item["recovery"]["status"], "success")
+            self.assertTrue(item["recovery"]["last_success_at"])
+
+    def test_failed_recovery_is_redacted_and_deferred_until_backoff_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
+            saved = store.upsert(
+                {"email": "user@example.com", "password": "password", "sso": "old-secret", "status": "active"}
+            )
+            service = self._service(temp_dir)
+            client = FakeGrok2APIClient()
+            client.list_result = {
+                "tokens": [{"token": "old-secret", "status": "active", "pool": "auto"}]
+            }
+            client.verify_result = {
+                "results": [{"token": "old-secret", "status": "invalid", "error": "expired"}]
+            }
+            failure = RuntimeError("user@example.com password old-secret login failed")
+
+            with patch.object(register_service_module, "grok_account_store", store), patch.object(
+                service, "_grok2api_client", return_value=client
+            ), patch.object(service, "_authorize_grok_recovery_sso", side_effect=failure) as authorize:
+                first = service._run_grok_probe_once()
+                second = service._run_grok_probe_once()
+
+            self.assertEqual(first["recovery_attempted"], 1)
+            self.assertEqual(first["recovery_failed"], 1)
+            self.assertEqual(second["recovery_attempted"], 0)
+            self.assertEqual(second["recovery_deferred"], 1)
+            authorize.assert_called_once_with(email="user@example.com", password="password")
+            item = store.get_accounts_by_ids([saved["item"]["id"]])[0]
+            self.assertEqual(item["sso"], "old-secret")
+            self.assertEqual(item["recovery"]["status"], "failed")
+            self.assertEqual(item["recovery"]["attempts"], 1)
+            self.assertTrue(item["recovery"]["next_attempt_at"])
+            encoded = json.dumps(item["recovery"], ensure_ascii=False)
+            self.assertNotIn("user@example.com", encoded)
+            self.assertNotIn("password", encoded)
+            self.assertNotIn("old-secret", encoded)
 
     def test_upstream_delete_failure_keeps_local_account(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -424,6 +424,49 @@ class ICloudPrivacyMailProviderTest(unittest.TestCase):
         self.assertEqual(session.request.call_args_list[0].kwargs["json"]["claimed"], True)
         self.assertEqual(session.request.call_args_list[1].kwargs["json"]["claimed"], False)
 
+    def test_mark_local_deactivated_mailbox_as_claimed(self) -> None:
+        session = self._session(self._response({"success": True, "updated": 1, "missing": []}))
+        mailbox = {
+            "provider": "icloud_api",
+            "address": "disabled@icloud.example",
+            "_icloud_claim_internal": True,
+            "_icloud_claim_base": "https://icloud-mail.example.test",
+            "_icloud_claim_project": "openai",
+        }
+
+        with patch.object(mail_provider, "_create_session", return_value=session):
+            mail_provider.mark_mailbox_result(
+                mailbox,
+                success=False,
+                error="validate_otp_http_403 code=account_deactivated",
+            )
+
+        url, kwargs = self._request_call(session, "POST")
+        self.assertEqual(url, "https://icloud-mail.example.test/api/v1/mailboxes/claim-status")
+        self.assertEqual(kwargs["json"]["claimed"], True)
+        effective_headers = {**session.headers, **dict(kwargs.get("headers") or {})}
+        self.assertEqual(effective_headers.get("X-ChatGPT2API-Internal"), "icloud-privacy-mail")
+
+    def test_mark_local_transient_failure_as_unclaimed(self) -> None:
+        session = self._session(self._response({"success": True, "updated": 1, "missing": []}))
+        mailbox = {
+            "provider": "icloud_api",
+            "address": "retry@icloud.example",
+            "_icloud_claim_internal": True,
+            "_icloud_claim_base": "https://icloud-mail.example.test",
+            "_icloud_claim_project": "openai",
+        }
+
+        with patch.object(mail_provider, "_create_session", return_value=session):
+            mail_provider.mark_mailbox_result(
+                mailbox,
+                success=False,
+                error="Cloudflare clearance unavailable",
+            )
+
+        _url, kwargs = self._request_call(session, "POST")
+        self.assertEqual(kwargs["json"]["claimed"], False)
+
     def test_code_request_appends_filters_and_normalizes_message(self) -> None:
         response = self._response(
             {

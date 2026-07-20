@@ -9,6 +9,7 @@ through OpenAI's Responses shape.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import queue
 import threading
@@ -50,7 +51,7 @@ _DEVICE_SESSION_MAX_SECONDS = 1_800
 _ERROR_BODY_LIMIT = 1_200
 _PROTOCOL_JOB_TTL_SECONDS = 3_600
 _PROTOCOL_DEFER_POLL_SECONDS = 2.0
-_PROTOCOL_QUEUE_IDLE_SECONDS = 5.0
+_PROTOCOL_QUEUE_WORKERS = 3
 _PROTOCOL_QUEUE_MAX_ATTEMPTS = 2
 _PROTOCOL_RETRY_STAGES = frozenset(
     {
@@ -97,6 +98,69 @@ def _safe_error_body(response: httpx.Response) -> str:
     return text[:_ERROR_BODY_LIMIT]
 
 
+def _optional_header_int(value: object) -> int | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        return max(0, int(text))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _response_quota(response: httpx.Response) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for key in ("requests", "tokens"):
+        limit = _optional_header_int(response.headers.get(f"x-ratelimit-limit-{key}"))
+        remaining = _optional_header_int(response.headers.get(f"x-ratelimit-remaining-{key}"))
+        if limit is None and remaining is None:
+            continue
+        window: dict[str, Any] = {}
+        if limit is not None:
+            window["limit"] = limit
+        if remaining is not None:
+            window["remaining"] = remaining
+        reset = _clean_text(response.headers.get(f"x-ratelimit-reset-{key}"))
+        if reset:
+            window["reset"] = reset[:100]
+        result[key] = window
+    return result
+
+
+def _response_error_fields(response: httpx.Response) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return "", _safe_error_body(response)
+    if not isinstance(payload, dict):
+        return "", _safe_error_body(response)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = _clean_text(error.get("code") or error.get("type"))[:120]
+        message = _clean_text(error.get("message") or error.get("detail"))[:500]
+        return code, message or _safe_error_body(response)
+    return (
+        _clean_text(payload.get("code") or payload.get("type"))[:120],
+        _clean_text(error or payload.get("message") or payload.get("detail"))[:500],
+    )
+
+
+def _response_probe_usage(response: httpx.Response) -> dict[str, int]:
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    usage = payload.get("usage") if isinstance(payload, dict) and isinstance(payload.get("usage"), dict) else {}
+    result: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens", "cost_in_usd_ticks"):
+        try:
+            value = max(0, int(usage.get(key)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        result[key] = value
+    return result
+
+
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
@@ -110,12 +174,15 @@ class XaiCliOAuthService:
         self._device_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._refresh_locks_guard = asyncio.Lock()
+        self._delivery_locks: dict[str, asyncio.Lock] = {}
+        self._delivery_locks_guard = asyncio.Lock()
         self._protocol_jobs: dict[str, dict[str, Any]] = {}
         self._protocol_job_lock = threading.RLock()
         self._protocol_tasks: set[asyncio.Task[Any]] = set()
         self._protocol_threads: set[threading.Thread] = set()
-        self._protocol_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
-        self._protocol_queue_worker: threading.Thread | None = None
+        self._protocol_queue: queue.PriorityQueue[tuple[int, int, str, dict[str, Any]]] = queue.PriorityQueue()
+        self._protocol_queue_sequence = itertools.count()
+        self._protocol_queue_workers: set[threading.Thread] = set()
         self.protocol_event_sink: Callable[[dict[str, Any]], None] | None = None
 
     def _client(self, *, proxy: str = "", timeout: float = 60.0) -> httpx.AsyncClient:
@@ -408,50 +475,66 @@ class XaiCliOAuthService:
         task.add_done_callback(self._protocol_tasks.discard)
         return result
 
-    def start_protocol_authorization_background(self, account_id: str = "") -> dict[str, Any]:
+    def start_protocol_authorization_background(
+        self,
+        account_id: str = "",
+        *,
+        prioritize: bool = False,
+        retry: bool = False,
+    ) -> dict[str, Any]:
         """Queue protocol OAuth from synchronous registration workers."""
         result, source = self._prepare_protocol_authorization(account_id)
         if source is None:
             return result
 
         job_id = _clean_text(result["job"].get("id"))
+        priority = 0 if prioritize else (20 if retry else 10)
+        self._protocol_queue.put((priority, next(self._protocol_queue_sequence), job_id, source))
+        self._ensure_protocol_workers()
+        result["queued"] = True
+        result["priority"] = "registration" if prioritize else ("retry" if retry else "backfill")
+        return result
+
+    def _protocol_worker_limit(self) -> int:
+        return _PROTOCOL_QUEUE_WORKERS
+
+    def _ensure_protocol_workers(self) -> None:
         with self._protocol_job_lock:
-            worker = self._protocol_queue_worker
-            if worker is None or not worker.is_alive():
+            self._protocol_queue_workers = {
+                worker for worker in self._protocol_queue_workers if worker.is_alive()
+            }
+            while len(self._protocol_queue_workers) < self._protocol_worker_limit():
                 worker = threading.Thread(
                     target=self._run_protocol_queue,
                     daemon=True,
-                    name="xai-protocol-queue",
+                    name=f"xai-protocol-queue-{len(self._protocol_queue_workers) + 1}",
                 )
-                self._protocol_queue_worker = worker
+                self._protocol_queue_workers.add(worker)
                 worker.start()
-        self._protocol_queue.put((job_id, source))
-        result["queued"] = True
-        return result
+
+    def protocol_queue_status(self) -> dict[str, int]:
+        with self._protocol_queue.mutex:
+            pending = list(self._protocol_queue.queue)
+        with self._protocol_job_lock:
+            workers = sum(1 for worker in self._protocol_queue_workers if worker.is_alive())
+            running = sum(
+                1
+                for job in self._protocol_jobs.values()
+                if _clean_text(job.get("status")) == "running"
+            )
+        return {
+            "queued": len(pending),
+            "running": running,
+            "workers": workers,
+            "registration": sum(1 for item in pending if item[0] == 0),
+            "backfill": sum(1 for item in pending if item[0] == 10),
+            "retry": sum(1 for item in pending if item[0] == 20),
+        }
 
     @staticmethod
     def _oauth_grok_config(runtime: dict[str, Any]) -> dict[str, Any]:
         source = runtime.get("grok") if isinstance(runtime.get("grok"), dict) else {}
-        config = dict(source)
-        stats = runtime.get("stats") if isinstance(runtime.get("stats"), dict) else {}
-        try:
-            running = int(stats.get("running") or 0)
-        except (TypeError, ValueError):
-            running = 0
-        registration_active = _clean_text(runtime.get("target")) == "grok" and (
-            bool(runtime.get("enabled")) or running > 0
-        )
-        if registration_active and _clean_text(config.get("provider")).lower() == "local":
-            try:
-                threads = max(1, min(16, int(runtime.get("threads") or 1)))
-            except (TypeError, ValueError):
-                threads = 1
-            try:
-                configured = max(1, min(16, int(config.get("local_concurrency") or 1)))
-            except (TypeError, ValueError):
-                configured = 1
-            config["local_concurrency"] = min(16, max(configured, threads + 1))
-        return config
+        return dict(source)
 
     @staticmethod
     def _resolve_registration_proxy(raw_proxy: object) -> str:
@@ -472,14 +555,7 @@ class XaiCliOAuthService:
 
     def _run_protocol_queue(self) -> None:
         while True:
-            try:
-                job_id, source = self._protocol_queue.get(timeout=_PROTOCOL_QUEUE_IDLE_SECONDS)
-            except queue.Empty:
-                with self._protocol_job_lock:
-                    if self._protocol_queue.empty():
-                        self._protocol_queue_worker = None
-                        return
-                continue
+            _priority, _sequence, job_id, source = self._protocol_queue.get()
             try:
                 runner = threading.current_thread()
                 with self._protocol_job_lock:
@@ -502,6 +578,7 @@ class XaiCliOAuthService:
                             self._emit_protocol_event(
                                 {
                                     "status": "failed",
+                                    "job_id": job_id,
                                     "source_account_id": _clean_text(source.get("id")),
                                     "email": _clean_text(source.get("email")),
                                     "error": _clean_text(job.get("error")),
@@ -559,6 +636,29 @@ class XaiCliOAuthService:
                 proxy="" if proxy == "direct" else proxy,
             )
             account_id = _clean_text((imported.get("account") or {}).get("id"))
+            probe = imported.get("probe") if isinstance(imported.get("probe"), dict) else {}
+            if _clean_text(probe.get("code")) == "permission-denied":
+                self._update_protocol_job(
+                    job_id,
+                    status="authorized",
+                    stage="permission_pending",
+                    message="OAuth 授权完成，Grok 4.5 权限待生效",
+                    error="",
+                    account=imported.get("account"),
+                    models=imported.get("models") if isinstance(imported.get("models"), list) else [],
+                    delivery={},
+                )
+                self._emit_protocol_event(
+                    {
+                        "status": "permission_pending",
+                        "job_id": job_id,
+                        "oauth_account_id": account_id,
+                        "source_account_id": _clean_text(source.get("id")),
+                        "email": _clean_text(source.get("email")),
+                        "delivery": {},
+                    }
+                )
+                return
             stored_account = self.store.get(account_id) if account_id else None
             delivery: dict[str, Any] = {}
             if isinstance(stored_account, dict):
@@ -607,6 +707,8 @@ class XaiCliOAuthService:
             self._emit_protocol_event(
                 {
                     "status": "authorized",
+                    "job_id": job_id,
+                    "oauth_account_id": account_id,
                     "source_account_id": _clean_text(source.get("id")),
                     "email": _clean_text(source.get("email")),
                     "delivery": delivery,
@@ -628,6 +730,7 @@ class XaiCliOAuthService:
                 self._emit_protocol_event(
                     {
                         "status": "failed",
+                        "job_id": job_id,
                         "source_account_id": _clean_text(source.get("id")),
                         "email": _clean_text(source.get("email")),
                         "error": error[:500],
@@ -653,7 +756,7 @@ class XaiCliOAuthService:
         source_type: str = "oauth_import",
         proxy: str = "",
     ) -> dict[str, Any]:
-        """Validate a credential against `/models` then persist it securely."""
+        """Validate model discovery and a real ``grok-4.5`` call, then persist it."""
         access = _clean_text(access_token)
         refresh = _clean_text(refresh_token)
         if not access:
@@ -696,7 +799,14 @@ class XaiCliOAuthService:
                 },
             }
         )
-        return {"account": account["item"], "models": model_ids}
+        probe = await self.probe_account(_clean_text(account["item"].get("id")))
+        if probe.get("status") == "invalid" and _clean_text(probe.get("code")) != "permission-denied":
+            raise UpstreamError(
+                "xAI CLI OAuth account cannot call grok-4.5",
+                status=int(probe.get("http_status") or 403),
+                body=_clean_text(probe.get("error")),
+            )
+        return {"account": probe.get("account") or account["item"], "models": model_ids, "probe": probe}
 
     async def _fetch_models(self, access_token: str, *, proxy: str = "") -> list[str]:
         async with self._client(proxy=proxy) as client:
@@ -722,7 +832,16 @@ class XaiCliOAuthService:
         account = await self._ensure_access_token(account)
         models = await self._fetch_models(_clean_text(account.get("access_token")), proxy=self._proxy_for(account))
         saved = self.store.set_available_models(_clean_text(account.get("id")), models)
-        return {"account": saved, "models": models}
+        probe = await self.probe_account(_clean_text(account.get("id")))
+        delivery = {}
+        if _clean_text(probe.get("status")).lower() == "valid":
+            delivery = await self._deliver_oauth_if_needed(_clean_text(account.get("id")))
+        return {
+            "account": self.store.get(_clean_text(account.get("id")), redacted=True) or probe.get("account") or saved,
+            "models": models,
+            "probe": probe,
+            "delivery": delivery,
+        }
 
     def _get_account(self, account_id: str) -> dict[str, Any]:
         items = self.store.get_accounts_by_ids([account_id])
@@ -740,6 +859,65 @@ class XaiCliOAuthService:
     async def _refresh_lock(self, account_id: str) -> asyncio.Lock:
         async with self._refresh_locks_guard:
             return self._refresh_locks.setdefault(account_id, asyncio.Lock())
+
+    async def _delivery_lock(self, account_id: str) -> asyncio.Lock:
+        async with self._delivery_locks_guard:
+            return self._delivery_locks.setdefault(account_id, asyncio.Lock())
+
+    @staticmethod
+    def _oauth_delivery_config() -> object:
+        from services.register_service import register_service
+
+        runtime = register_service.get()
+        grok = runtime.get("grok") if isinstance(runtime.get("grok"), dict) else {}
+        return grok.get("oauth_delivery")
+
+    async def _deliver_oauth_if_needed(self, account_id: str) -> dict[str, Any]:
+        from services.xai_oauth_delivery_service import (
+            deliver_xai_oauth_account,
+            normalize_xai_oauth_delivery_config,
+        )
+
+        clean_id = _clean_text(account_id)
+        if not clean_id:
+            return {}
+        lock = await self._delivery_lock(clean_id)
+        async with lock:
+            account = self.store.get(clean_id)
+            if not isinstance(account, dict):
+                return {}
+            raw_config = self._oauth_delivery_config()
+            settings = normalize_xai_oauth_delivery_config(raw_config)
+            metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+            existing = metadata.get("oauth_delivery") if isinstance(metadata.get("oauth_delivery"), dict) else {}
+            pending = {
+                name
+                for name, target in settings.items()
+                if bool(target.get("enabled"))
+                and _clean_text((existing.get(name) or {}).get("status")) != "success"
+            }
+            if not pending:
+                return existing
+
+            effective = {
+                name: {**target, "enabled": name in pending}
+                for name, target in settings.items()
+            }
+            delivered = await asyncio.to_thread(
+                deliver_xai_oauth_account,
+                account,
+                effective,
+            )
+            merged = dict(existing)
+            for name, result in delivered.items():
+                if (
+                    _clean_text(result.get("status") if isinstance(result, dict) else "") == "skipped"
+                    and _clean_text((existing.get(name) or {}).get("status")) == "success"
+                ):
+                    continue
+                merged[name] = result
+            self.store.update_metadata(clean_id, {"oauth_delivery": merged})
+            return merged
 
     async def _ensure_access_token(self, account: dict[str, Any], *, force_refresh: bool = False) -> dict[str, Any]:
         account_id = _clean_text(account.get("id"))
@@ -862,6 +1040,135 @@ class XaiCliOAuthService:
                 self.store.record_result(account_id, False, _clean_text(exc) or type(exc).__name__)
             raise
 
+    async def probe_account(self, account_id: str, *, persist: bool = True) -> dict[str, Any]:
+        """Probe one OAuth account with the real model and persist safe quota headers."""
+        account = self._get_account(account_id)
+        account_id = _clean_text(account.get("id"))
+        probed_at = datetime.now(timezone.utc).isoformat()
+        response: httpx.Response | None = None
+
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            result["probed_at"] = probed_at
+            result["account"] = (
+                self.store.update_probe_result(
+                    account_id,
+                    status=_clean_text(result.get("status")),
+                    model=GROK_45_MODEL_ID,
+                    http_status=int(result.get("http_status") or 0),
+                    code=_clean_text(result.get("code")),
+                    error=_clean_text(result.get("error")),
+                    quota=result.get("quota") if isinstance(result.get("quota"), dict) else {},
+                    usage=result.get("usage") if isinstance(result.get("usage"), dict) else {},
+                    probed_at=probed_at,
+                )
+                if persist
+                else None
+            )
+            return result
+
+        try:
+            account = await self._ensure_access_token(account)
+            payload = {
+                "model": GROK_45_MODEL_ID,
+                "input": chat_messages_to_response_input([{"role": "user", "content": "Reply only OK."}]),
+                "stream": False,
+                "max_output_tokens": 8,
+            }
+            response = await self._post_response(account, payload)
+            if response.status_code in {401, 403}:
+                account = await self._ensure_access_token(account, force_refresh=True)
+                response = await self._post_response(account, payload)
+
+            code, error = _response_error_fields(response)
+            if 200 <= response.status_code < 300:
+                status = "valid"
+            elif response.status_code == 429:
+                status = "limited"
+            elif response.status_code in {401, 403} or (
+                response.status_code == 402 and code == "personal-team-blocked"
+            ):
+                status = "invalid"
+            else:
+                status = "unknown"
+            quota = _response_quota(response)
+            usage = _response_probe_usage(response)
+            return finish({
+                "account_id": account_id,
+                "status": status,
+                "model": GROK_45_MODEL_ID,
+                "http_status": response.status_code,
+                "code": code,
+                "error": error,
+                "quota": quota,
+                "usage": usage,
+            })
+        except ValidationError as exc:
+            error = _clean_text(exc) or "OAuth credential is invalid"
+            return finish({
+                "account_id": account_id,
+                "status": "invalid",
+                "model": GROK_45_MODEL_ID,
+                "http_status": 0,
+                "code": "invalid_credentials",
+                "error": error,
+                "quota": {},
+                "usage": {},
+            })
+        except Exception as exc:
+            error = _clean_text(exc) or type(exc).__name__
+            return finish({
+                "account_id": account_id,
+                "status": "unknown",
+                "model": GROK_45_MODEL_ID,
+                "http_status": response.status_code if response is not None else 0,
+                "code": "",
+                "error": error,
+                "quota": {},
+                "usage": {},
+            })
+
+    async def probe_accounts(self, account_ids: list[str], *, concurrency: int = 10) -> dict[str, Any]:
+        ordered_ids = list(dict.fromkeys(_clean_text(value) for value in account_ids if _clean_text(value)))
+        semaphore = asyncio.Semaphore(max(1, min(25, int(concurrency or 1))))
+
+        async def run(account_id: str) -> dict[str, Any]:
+            async with semaphore:
+                return await self.probe_account(account_id, persist=False)
+
+        results = await asyncio.gather(*(run(account_id) for account_id in ordered_ids))
+        saved_by_id = {
+            _clean_text(item.get("id")): item
+            for item in self.store.update_probe_results(results)
+            if _clean_text(item.get("id"))
+        }
+        summary = {"total": len(results), "valid": 0, "limited": 0, "invalid": 0, "unknown": 0}
+        for result in results:
+            result["account"] = saved_by_id.get(_clean_text(result.get("account_id")))
+            status = _clean_text(result.get("status")).lower()
+            summary[status if status in {"valid", "limited", "invalid", "unknown"} else "unknown"] += 1
+        valid_results = [
+            result
+            for result in results
+            if _clean_text(result.get("status")).lower() == "valid"
+        ]
+
+        async def deliver_valid(result: dict[str, Any]) -> None:
+            account_id = _clean_text(result.get("account_id"))
+            result["delivery"] = await self._deliver_oauth_if_needed(account_id)
+            result["account"] = self.store.get(account_id, redacted=True)
+
+        await asyncio.gather(*(deliver_valid(result) for result in valid_results))
+        summary["delivery_checked"] = len(valid_results)
+        summary["delivery_success"] = sum(
+            1
+            for result in valid_results
+            if any(
+                isinstance(item, dict) and _clean_text(item.get("status")) == "success"
+                for item in (result.get("delivery") or {}).values()
+            )
+        )
+        return {"results": results, "summary": summary}
+
     async def create_response(
         self,
         payload: dict[str, Any],
@@ -922,7 +1229,10 @@ class XaiCliOAuthService:
             )
 
     def _mark_response_failure(self, account: dict[str, Any], response: httpx.Response) -> None:
-        if response.status_code in {401, 403}:
+        code, _error = _response_error_fields(response)
+        if response.status_code in {401, 403} or (
+            response.status_code == 402 and code == "personal-team-blocked"
+        ):
             self.store.set_status([_clean_text(account.get("id"))], "invalid")
 
     async def _stream_response(

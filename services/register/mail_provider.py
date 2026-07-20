@@ -2780,10 +2780,26 @@ def wait_for_code(mail_config: dict, mailbox: dict, *, wait_timeout: float | Non
         provider.close()
 
 
+def _icloud_mailbox_result_claimed(*, success: bool, error: Exception | str | None) -> bool:
+    if success:
+        return True
+    reason = str(error or "").strip().lower()
+    return any(
+        marker in reason
+        for marker in (
+            "account_deactivated",
+            "deleted or deactivated",
+            "openaiemailalreadyregistered",
+            "already registered",
+            "已存在 gpt 账号",
+        )
+    )
+
+
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
-    iCloud 本地邮箱按 GPT/Grok 项目独立更新注册标签；Outlook Token 邮箱继续记录
+    iCloud 邮箱按 GPT/Grok 项目独立更新注册标签；Outlook Token 邮箱继续记录
     used、token_invalid、login_required 或 failed 状态。
     """
     if str(mailbox.get("provider") or "") == ICloudPrivacyMailProvider.name and bool(mailbox.get("_icloud_claim_internal")):
@@ -2799,7 +2815,10 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
                 {"request_timeout": 15, "wait_timeout": 15, "wait_interval": 1, "user_agent": "chatgpt2api", "proxy": ""},
             )
             try:
-                provider.update_claim(mailbox, success)
+                provider.update_claim(
+                    mailbox,
+                    _icloud_mailbox_result_claimed(success=success, error=error),
+                )
             finally:
                 provider.close()
         except Exception:

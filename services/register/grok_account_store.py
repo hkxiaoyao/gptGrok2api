@@ -425,6 +425,183 @@ class GrokAccountStore:
             }
             return [copy.deepcopy(by_id[account_id]) for account_id in ordered_ids if account_id in by_id]
 
+    def update_probe_results(self, results: list[dict[str, Any]], *, probed_at: str) -> dict[str, int]:
+        """Persist credential-free login probe outcomes by stable account ID."""
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw in results:
+            if not isinstance(raw, dict):
+                continue
+            account_id = _clean_text(raw.get("id"))
+            status = _clean_text(raw.get("status")).lower()
+            if not account_id or status not in {"valid", "invalid", "unknown"}:
+                continue
+            probe: dict[str, Any] = {
+                "status": status,
+                "at": _clean_text(probed_at) or _now(),
+            }
+            quota = raw.get("quota") if isinstance(raw.get("quota"), dict) else None
+            if quota is not None:
+                probe["quota"] = {
+                    "remaining": _non_negative_int(quota.get("remaining")),
+                    "total": _non_negative_int(quota.get("total")),
+                }
+            error = _clean_text(raw.get("error"))
+            if error:
+                probe["error"] = error[:300]
+            normalized[account_id] = probe
+
+        if not normalized:
+            return {"updated": 0, "missing": 0}
+
+        with self._lock:
+            items = self._load_unlocked()
+            updated = 0
+            matched: set[str] = set()
+            now = _now()
+            next_items: list[dict[str, Any]] = []
+            for item in items:
+                current = dict(item)
+                account_id = _clean_text(current.get("id"))
+                probe = normalized.get(account_id)
+                if probe is not None:
+                    current["probe"] = probe
+                    current["updated_at"] = now
+                    matched.add(account_id)
+                    updated += 1
+                next_items.append(current)
+            if updated:
+                self._save_unlocked(next_items)
+            return {"updated": updated, "missing": len(normalized) - len(matched)}
+
+    def update_recovery_state(
+        self,
+        account_id: str,
+        *,
+        status: str,
+        last_attempt_at: str | None = None,
+        last_success_at: str | None = None,
+        next_attempt_at: str | None = None,
+        error: str | None = None,
+        attempts: int | None = None,
+    ) -> bool:
+        """Persist non-secret automatic recovery state for one stable account ID."""
+        target_id = _clean_text(account_id)
+        normalized_status = _clean_text(status).lower()
+        if not target_id or normalized_status not in {"pending", "running", "success", "failed"}:
+            return False
+
+        with self._lock:
+            items = self._load_unlocked()
+            now = _now()
+            changed = False
+            next_items: list[dict[str, Any]] = []
+            for item in items:
+                current = dict(item)
+                if _clean_text(current.get("id")) != target_id:
+                    next_items.append(current)
+                    continue
+
+                recovery = dict(current.get("recovery")) if isinstance(current.get("recovery"), dict) else {}
+                recovery["status"] = normalized_status
+                if last_attempt_at is not None:
+                    recovery["last_attempt_at"] = _clean_text(last_attempt_at)
+                if last_success_at is not None:
+                    recovery["last_success_at"] = _clean_text(last_success_at)
+                if next_attempt_at is not None:
+                    recovery["next_attempt_at"] = _clean_text(next_attempt_at)
+                if error is not None:
+                    recovery["error"] = _clean_text(error)[:300]
+                if attempts is not None:
+                    recovery["attempts"] = _non_negative_int(attempts)
+                current["recovery"] = recovery
+                current["updated_at"] = now
+                changed = True
+                next_items.append(current)
+
+            if changed:
+                self._save_unlocked(next_items)
+            return changed
+
+    def replace_sso_after_recovery(
+        self,
+        account_id: str,
+        *,
+        expected_sso: str,
+        new_sso: str,
+        recovered_at: str,
+        quota: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace one account's SSO and absorb its runtime-only mirror."""
+        target_id = _clean_text(account_id)
+        expected = _normalize_sso(expected_sso)
+        replacement = _normalize_sso(new_sso)
+        if not target_id or not replacement:
+            raise ValueError("Grok 自动恢复缺少账号 ID 或新 SSO")
+
+        with self._lock:
+            items = self._load_unlocked()
+            target_index = next(
+                (index for index, item in enumerate(items) if _clean_text(item.get("id")) == target_id),
+                None,
+            )
+            if target_index is None:
+                raise ValueError("Grok 自动恢复账号不存在")
+
+            target = dict(items[target_index])
+            if _normalize_sso(target.get("sso")) != expected:
+                raise RuntimeError("Grok 账号登录态已被其他操作更新")
+
+            duplicate_indexes: set[int] = set()
+            for index, item in enumerate(items):
+                if index == target_index or _normalize_sso(item.get("sso")) != replacement:
+                    continue
+                is_runtime_only = (
+                    _clean_text(item.get("source_type")).lower() == "runtime"
+                    and not _clean_text(item.get("email"))
+                    and not _clean_text(item.get("password"))
+                )
+                if not is_runtime_only:
+                    raise RuntimeError("新 Grok SSO 已属于其他已保存账号")
+                duplicate_indexes.add(index)
+                if isinstance(item.get("runtime"), dict):
+                    target["runtime"] = copy.deepcopy(item["runtime"])
+
+            timestamp = _clean_text(recovered_at) or _now()
+            probe: dict[str, Any] = {"status": "valid", "at": timestamp}
+            if isinstance(quota, dict):
+                probe["quota"] = {
+                    "remaining": _non_negative_int(quota.get("remaining")),
+                    "total": _non_negative_int(quota.get("total")),
+                }
+            recovery = dict(target.get("recovery")) if isinstance(target.get("recovery"), dict) else {}
+            recovery.update(
+                {
+                    "status": "success",
+                    "last_attempt_at": timestamp,
+                    "last_success_at": timestamp,
+                    "next_attempt_at": "",
+                    "error": "",
+                    "attempts": 0,
+                }
+            )
+            target.update(
+                {
+                    "sso": replacement,
+                    "status": "active",
+                    "probe": probe,
+                    "recovery": recovery,
+                    "updated_at": timestamp,
+                }
+            )
+
+            next_items: list[dict[str, Any]] = []
+            for index, item in enumerate(items):
+                if index in duplicate_indexes:
+                    continue
+                next_items.append(target if index == target_index else item)
+            self._save_unlocked(next_items)
+            return copy.deepcopy(target)
+
     def get_login_credentials(self, account_id: str) -> dict[str, str] | None:
         """Return only the email/password pair for one explicit admin action."""
         target_id = _clean_text(account_id)

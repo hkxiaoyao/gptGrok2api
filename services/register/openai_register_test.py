@@ -69,7 +69,7 @@ class PasswordlessSignupFallbackTest(unittest.TestCase):
         )
         registrar._register_user = MagicMock()
         registrar._send_otp = MagicMock()
-        registrar._validate_otp = MagicMock()
+        registrar._validate_otp = MagicMock(return_value="https://auth.openai.com/about-you")
         registrar._create_account = MagicMock()
         registrar._exchange_registered_tokens = MagicMock(
             return_value={"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
@@ -136,6 +136,166 @@ class ValidateOtpTest(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs["json"], {"code": "123456"})
         self.assertEqual(request.call_args.kwargs["retry_attempts"], 1)
         sentinel.assert_not_called()
+
+
+class PlatformRegistrarAuthorizationStepTest(unittest.TestCase):
+    @staticmethod
+    def _registrar() -> openai_register.PlatformRegistrar:
+        registrar = object.__new__(openai_register.PlatformRegistrar)
+        registrar.proxy = ""
+        registrar.session = MagicMock()
+        registrar.clearance_user_agent = ""
+        registrar.clearance_failure_reason = ""
+        registrar.device_id = "test-device"
+        registrar.fingerprint = {}
+        registrar.passwordless_signup = False
+        registrar.platform_auth_code = ""
+        registrar.last_otp_continue_url = ""
+        return registrar
+
+    @staticmethod
+    def _response(payload: dict, status_code: int = 200, *, url: str = "") -> MagicMock:
+        response = MagicMock()
+        response.status_code = status_code
+        response.url = url
+        response.headers = {}
+        response.text = str(payload)
+        response.json.return_value = payload
+        return response
+
+    def test_validate_otp_returns_the_final_authorization_url(self) -> None:
+        registrar = self._registrar()
+        response = self._response({"continue_url": "/about-you"})
+        registrar._authorize_continue = MagicMock(return_value="https://auth.openai.com/about-you")
+
+        with patch.object(openai_register, "validate_otp", return_value=(response, "")):
+            final_url = registrar._validate_otp("123456", 1)
+
+        self.assertEqual(final_url, "https://auth.openai.com/about-you")
+        self.assertEqual(registrar.last_otp_continue_url, "/about-you")
+        registrar._authorize_continue.assert_called_once_with("/about-you", 1)
+
+    def test_authorize_continue_returns_callback_url(self) -> None:
+        registrar = self._registrar()
+        registrar._navigate_headers = MagicMock(return_value={})
+        callback_url = "https://platform.openai.com/auth/callback?code=oauth-code&state=oauth-state"
+        response = self._response({}, url=callback_url)
+
+        with (
+            patch.object(openai_register, "_headers_with_clearance", side_effect=lambda headers, *_args: headers),
+            patch.object(openai_register, "_is_cloudflare_challenge", return_value=False),
+            patch.object(openai_register, "request_with_local_retry", return_value=(response, "")),
+        ):
+            final_url = registrar._authorize_continue("/authorize/resume", 1)
+
+        self.assertEqual(final_url, callback_url)
+
+    def test_authorize_continue_login_logs_actual_mail_provider(self) -> None:
+        for provider, expected_label in (
+            ("icloud_api", "iCloud 邮箱"),
+            ("icloud_local", "iCloud 邮箱"),
+            ("outlook_token", "Microsoft 邮箱"),
+        ):
+            with self.subTest(provider=provider):
+                registrar = self._registrar()
+                registrar._json_headers = MagicMock(return_value={})
+                response = self._response({"page": {"type": "email_otp_verification"}})
+
+                with (
+                    patch.object(openai_register, "build_sentinel_token", return_value="sentinel"),
+                    patch.object(openai_register, "_headers_with_clearance", side_effect=lambda headers, *_args: headers),
+                    patch.object(openai_register, "request_with_local_retry", return_value=(response, "")),
+                    patch.object(openai_register, "step") as step,
+                ):
+                    registrar._authorize_continue_login(
+                        "person@example.test",
+                        {"provider": provider},
+                        1,
+                    )
+
+                step.assert_any_call(1, f"提交 {expected_label}进入登录验证")
+
+    def test_register_skips_create_account_after_oauth_callback(self) -> None:
+        registrar = self._registrar()
+
+        def authorize(_email: str, _index: int) -> str:
+            registrar.passwordless_signup = True
+            return ""
+
+        registrar._platform_authorize = MagicMock(side_effect=authorize)
+        registrar._validate_otp = MagicMock(
+            return_value="https://platform.openai.com/auth/callback?code=oauth-code&state=oauth-state"
+        )
+        registrar._create_account = MagicMock()
+        registrar._exchange_registered_tokens = MagicMock(
+            return_value={"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
+        )
+        mailbox = {"address": "callback@example.test", "label": "test"}
+
+        with (
+            patch.object(openai_register, "create_mailbox", return_value=mailbox),
+            patch.object(openai_register, "wait_for_code", return_value="123456"),
+            patch.object(openai_register.mail_provider, "mark_mailbox_result") as mark_mailbox_result,
+            patch.object(openai_register, "_random_name", return_value=("Ada", "Lovelace")),
+        ):
+            result = registrar.register(1)
+
+        self.assertEqual(result["access_token"], "access")
+        self.assertEqual(registrar.platform_auth_code, "oauth-code")
+        registrar._create_account.assert_not_called()
+        registrar._exchange_registered_tokens.assert_called_once_with(1)
+        mark_mailbox_result.assert_called_once_with(mailbox, success=True)
+
+    def test_register_marks_login_flow_and_retries_without_sending_login_otp(self) -> None:
+        registrar = self._registrar()
+        registrar._platform_authorize = MagicMock(return_value="login")
+        registrar._passwordless_login = MagicMock()
+        mailbox = {
+            "address": "existing@example.test",
+            "provider": "icloud_api",
+            "label": "test",
+        }
+
+        with (
+            patch.object(openai_register, "create_mailbox", return_value=mailbox),
+            patch.object(openai_register.mail_provider, "mark_mailbox_result") as mark_mailbox_result,
+            self.assertRaises(openai_register.OpenAIEmailAlreadyRegistered) as raised,
+        ):
+            registrar.register(1)
+
+        self.assertEqual(raised.exception.email, "existing@example.test")
+        self.assertEqual(raised.exception.reason, "existing_account")
+        registrar._passwordless_login.assert_not_called()
+        mark_mailbox_result.assert_called_once_with(mailbox, success=True)
+
+    def test_register_converts_account_deactivated_into_fresh_email_retry(self) -> None:
+        registrar = self._registrar()
+
+        def authorize(_email: str, _index: int) -> str:
+            registrar.passwordless_signup = True
+            return ""
+
+        registrar._platform_authorize = MagicMock(side_effect=authorize)
+        registrar._validate_otp = MagicMock(
+            side_effect=RuntimeError("passwordless_validate_otp_http_403 code=account_deactivated")
+        )
+        mailbox = {
+            "address": "disabled@example.test",
+            "provider": "icloud_api",
+            "label": "test",
+        }
+
+        with (
+            patch.object(openai_register, "create_mailbox", return_value=mailbox),
+            patch.object(openai_register, "wait_for_code", return_value="123456"),
+            patch.object(openai_register.mail_provider, "mark_mailbox_result") as mark_mailbox_result,
+            self.assertRaises(openai_register.OpenAIEmailAlreadyRegistered) as raised,
+        ):
+            registrar.register(1)
+
+        self.assertEqual(raised.exception.email, "disabled@example.test")
+        self.assertEqual(raised.exception.reason, "account_deactivated")
+        mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
 
 class ChatGPTWebRegistrarTest(unittest.TestCase):
@@ -929,6 +1089,27 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
         fresh.close.assert_not_called()
         self.assertTrue(any("已标记 GPT；自动更换邮箱" in str(call) for call in step.call_args_list))
 
+    def test_replaces_deactivated_account_email_with_fresh_registrar(self) -> None:
+        deactivated = MagicMock()
+        deactivated.register.side_effect = openai_register.OpenAIEmailAlreadyRegistered(
+            "disabled@example.test",
+            reason="account_deactivated",
+        )
+        fresh = MagicMock()
+        fresh.register.return_value = {"email": "fresh@example.test", "access_token": "access"}
+
+        with (
+            patch.object(openai_register, "PlatformRegistrar", side_effect=[deactivated, fresh]),
+            patch.object(openai_register, "step") as step,
+        ):
+            registrar, result = openai_register._register_with_fresh_email(3)
+
+        self.assertIs(registrar, fresh)
+        self.assertEqual(result["email"], "fresh@example.test")
+        deactivated.close.assert_called_once_with()
+        fresh.close.assert_not_called()
+        self.assertTrue(any("OpenAI 账号已删除或停用" in str(call) for call in step.call_args_list))
+
     def test_stops_after_existing_account_retry_limit(self) -> None:
         registrars = [MagicMock(), MagicMock()]
         for index, registrar in enumerate(registrars, start=1):
@@ -940,7 +1121,7 @@ class OpenAIExistingEmailRetryTest(unittest.TestCase):
             patch.object(openai_register, "OPENAI_EXISTING_EMAIL_RETRY_LIMIT", 2),
             patch.object(openai_register, "PlatformRegistrar", side_effect=registrars),
             patch.object(openai_register, "step"),
-            self.assertRaisesRegex(RuntimeError, "连续 2 个邮箱已存在 GPT 账号"),
+            self.assertRaisesRegex(RuntimeError, "连续 2 个邮箱不可用于 GPT 新注册"),
         ):
             openai_register._register_with_fresh_email(1)
 

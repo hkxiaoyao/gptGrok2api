@@ -630,11 +630,6 @@ const menuItems = [
     icon: 'M12 12a3.5 3.5 0 1 0-3.5-3.5A3.5 3.5 0 0 0 12 12zm0 2c-4.1 0-7.5 2.2-7.5 5v1h15v-1c0-2.8-3.4-5-7.5-5z',
   },
   {
-    path: '/grok-runtime',
-    label: 'Grok Runtime',
-    icon: 'M5 4h14a2 2 0 0 1 2 2v5h-2V6H5v12h14v-5h2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm7 4a4 4 0 1 1-4 4 4 4 0 0 1 4-4zm0 2a2 2 0 1 0 2 2 2 2 0 0 0-2-2z',
-  },
-  {
     path: '/register',
     label: '注册账号',
     icon: 'M7 3h10a2 2 0 0 1 2 2v3h-2V5H7v14h10v-3h2v3a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm8.6 5.4L20.2 13l-4.6 4.6-1.4-1.4 2.2-2.2H9v-2h7.4l-2.2-2.2 1.4-1.4z',
@@ -677,7 +672,6 @@ const utilityMenuItems = [
 const routeTitleMap: Record<string, string> = {
   dashboard: '概览中心',
   accounts: '账号管理',
-  'grok-runtime': 'Grok Runtime',
   logs: '日志管理',
   gallery: '图片管理',
   proxy: '代理管理',
@@ -848,7 +842,6 @@ const updateCheckingMessage = '正在从 GitHub 检查版本...'
 const routeViewLoaders: Record<string, () => Promise<unknown>> = {
   '/': () => import('@/views/Dashboard.vue'),
   '/accounts': () => import('@/views/Accounts.vue'),
-  '/grok-runtime': () => import('@/views/GrokRuntime.vue'),
   '/logs': () => import('@/views/Logs.vue'),
   '/gallery': () => import('@/views/Gallery.vue'),
   '/monitor': () => import('@/views/Monitor.vue'),

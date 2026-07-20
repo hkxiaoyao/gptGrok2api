@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from services.xai_cli_oauth_store import XaiCliOAuthAccountStore
 
@@ -84,6 +85,62 @@ class XaiCliOAuthAccountStoreTest(unittest.TestCase):
         self.assertNotIn("access-one", repr(updated))
         raw = self.store.get(saved["id"])
         self.assertEqual(raw["metadata"]["oauth_delivery"]["sub2api"]["target_id"], "server-one")
+
+    def test_probe_result_persists_safe_quota_and_preserves_disabled_state(self) -> None:
+        saved = self.store.upsert(self._payload("person@example.com", "subject-one", "one"))["item"]
+        self.store.set_disabled(saved["id"], True)
+
+        updated = self.store.update_probe_result(
+            saved["id"],
+            status="valid",
+            model="grok-4.5",
+            http_status=200,
+            quota={
+                "requests": {"limit": 21, "remaining": 20},
+                "tokens": {"limit": 1000000, "remaining": 999000},
+            },
+            usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        )
+
+        self.assertEqual(updated["status"], "disabled")
+        self.assertEqual(updated["probe"]["status"], "valid")
+        self.assertEqual(updated["quota"]["requests"]["remaining"], 20)
+        self.assertNotIn("access-one", repr(updated))
+
+    def test_probe_batch_rewrites_account_file_once(self) -> None:
+        first = self.store.upsert(self._payload("one@example.com", "subject-one", "one"))["item"]
+        second = self.store.upsert(self._payload("two@example.com", "subject-two", "two"))["item"]
+
+        with patch.object(self.store, "_save_unlocked", wraps=self.store._save_unlocked) as save:
+            updated = self.store.update_probe_results(
+                [
+                    {"account_id": first["id"], "status": "valid", "model": "grok-4.5", "http_status": 200},
+                    {"account_id": second["id"], "status": "limited", "model": "grok-4.5", "http_status": 429},
+                ]
+            )
+
+        self.assertEqual(len(updated), 2)
+        self.assertEqual(save.call_count, 1)
+
+    def test_recovery_state_is_safe_and_resolves_by_job_id(self) -> None:
+        saved = self.store.upsert(self._payload("person@example.com", "subject-one", "one"))["item"]
+
+        updated = self.store.update_recovery_state(
+            saved["id"],
+            status="pending",
+            job_id="oauth-recovery-job-one",
+            source_account_id="grok-source-one",
+            last_attempt_at="2030-01-01T00:00:00+00:00",
+            attempts=2,
+            error="access-one must not leak",
+        )
+
+        self.assertEqual(updated["recovery"]["status"], "pending")
+        self.assertEqual(updated["recovery"]["job_id"], "oauth-recovery-job-one")
+        self.assertEqual(updated["recovery"]["error"], "*** must not leak")
+        resolved = self.store.find_by_recovery_job_id("oauth-recovery-job-one", redacted=True)
+        self.assertEqual(resolved["id"], saved["id"])
+        self.assertNotIn("access-one", repr(resolved))
 
     def test_subject_deduplicates_refresh_token_rotation_and_preserves_identity(self) -> None:
         first = self.store.upsert(self._payload("first@example.com", "stable-subject", "one"))

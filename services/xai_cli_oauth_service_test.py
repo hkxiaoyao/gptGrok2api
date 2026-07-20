@@ -45,12 +45,38 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_import_validates_models_and_gates_catalog(self) -> None:
         access = _jwt({"sub": "subject-import", "email": "import@example.com", "exp": int(time.time()) + 3600})
-        with patch.object(self.service, "_fetch_models", new=AsyncMock(return_value=["grok-4.5"])):
+        with patch.object(self.service, "_fetch_models", new=AsyncMock(return_value=["grok-4.5"])), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(return_value={"status": "valid"}),
+        ):
             result = await self.service.import_credentials(access_token=access, refresh_token="refresh-import")
 
         self.assertEqual(result["account"]["email"], "im***t@example.com")
         self.assertTrue(self.service.supports_model("grok-4.5"))
         self.assertEqual(self.service.model_items()[0]["id"], "grok-4.5")
+
+    async def test_import_keeps_permission_denied_for_delayed_retry(self) -> None:
+        access = _jwt({"sub": "subject-pending", "email": "pending@example.com", "exp": int(time.time()) + 3600})
+        with patch.object(self.service, "_fetch_models", new=AsyncMock(return_value=["grok-4.5"])), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(
+                return_value={
+                    "status": "invalid",
+                    "http_status": 403,
+                    "code": "permission-denied",
+                    "error": "permission pending",
+                }
+            ),
+        ):
+            result = await self.service.import_credentials(
+                access_token=access,
+                refresh_token="refresh-pending",
+            )
+
+        self.assertEqual(result["probe"]["code"], "permission-denied")
+        self.assertEqual(len(self.store.list_accounts(redacted=False)), 1)
 
     async def test_protocol_job_imports_credentials_without_exposing_source_password(self) -> None:
         source = {
@@ -66,6 +92,8 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             "expires_in": 3600,
         }
         protocol = SimpleNamespace(authorize=lambda **_kwargs: credential)
+        events: list[dict[str, object]] = []
+        self.service.protocol_event_sink = events.append
 
         with patch.object(self.service, "_select_protocol_source_account", return_value=source), patch(
             "services.register_service.register_service.get",
@@ -77,6 +105,10 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             self.service,
             "_fetch_models",
             new=AsyncMock(return_value=["grok-4.5"]),
+        ), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(return_value={"status": "valid"}),
         ):
             started = await self.service.start_protocol_authorization()
             job_id = started["job"]["id"]
@@ -92,6 +124,61 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("source-password", repr(job))
         self.assertNotIn("protocol-refresh", repr(job))
         self.assertEqual(self.store.list_accounts()[0]["source_type"], "registered_account_protocol")
+        self.assertEqual(events[-1]["job_id"], job_id)
+        self.assertEqual(events[-1]["oauth_account_id"], self.store.list_accounts()[0]["id"])
+
+    async def test_protocol_permission_denied_waits_without_external_delivery(self) -> None:
+        source = {
+            "id": "grok-permission-pending",
+            "email": "pending@example.com",
+            "password": "source-password",
+        }
+        credential = {
+            "access_token": _jwt({"sub": "pending-subject", "email": "pending@example.com", "exp": int(time.time()) + 3600}),
+            "refresh_token": "pending-refresh",
+            "id_token": "",
+            "expires_in": 3600,
+        }
+        protocol = SimpleNamespace(authorize=lambda **_kwargs: credential)
+        events: list[dict[str, object]] = []
+        self.service.protocol_event_sink = events.append
+
+        with patch.object(self.service, "_select_protocol_source_account", return_value=source), patch(
+            "services.register_service.register_service.get",
+            return_value={"grok": {"oauth_delivery": {"sub2api": {"enabled": True}}}, "proxy": "direct"},
+        ), patch(
+            "services.xai_device_oauth_protocol.XaiDeviceOAuthProtocol",
+            return_value=protocol,
+        ), patch.object(
+            self.service,
+            "_fetch_models",
+            new=AsyncMock(return_value=["grok-4.5"]),
+        ), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(
+                return_value={
+                    "status": "invalid",
+                    "http_status": 403,
+                    "code": "permission-denied",
+                    "error": "permission pending",
+                }
+            ),
+        ), patch(
+            "services.xai_oauth_delivery_service.deliver_xai_oauth_account",
+        ) as deliver:
+            started = await self.service.start_protocol_authorization("grok-permission-pending")
+            job_id = started["job"]["id"]
+            for _ in range(50):
+                await asyncio.sleep(0)
+                job = self.service.get_protocol_authorization_job(job_id)
+                if job and job["status"] not in {"pending", "running"}:
+                    break
+
+        self.assertEqual(job["status"], "authorized")
+        self.assertEqual(job["stage"], "permission_pending")
+        self.assertEqual(events[-1]["status"], "permission_pending")
+        deliver.assert_not_called()
 
     async def test_protocol_jobs_are_reused_per_source_account(self) -> None:
         first = {"id": "grok-one", "email": "one@example.com", "password": "password"}
@@ -143,6 +230,10 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             self.service,
             "_fetch_models",
             new=AsyncMock(return_value=["grok-4.5"]),
+        ), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(return_value={"status": "valid"}),
         ), patch(
             "services.xai_oauth_delivery_service.deliver_xai_oauth_account",
             delivery_mock,
@@ -242,7 +333,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         job = self.service.get_protocol_authorization_job(started["job"]["id"])
         self.assertEqual(job["status"], "authorized")
 
-    def test_oauth_reserves_one_solver_slot_during_registration(self) -> None:
+    def test_oauth_keeps_configured_solver_limit_during_registration(self) -> None:
         active = self.service._oauth_grok_config(
             {
                 "enabled": True,
@@ -252,7 +343,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
                 "grok": {"provider": "local", "local_concurrency": 3},
             }
         )
-        self.assertEqual(active["local_concurrency"], 4)
+        self.assertEqual(active["local_concurrency"], 3)
 
         idle = self.service._oauth_grok_config(
             {
@@ -264,6 +355,67 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(idle["local_concurrency"], 3)
+
+    async def test_background_protocol_runs_while_registration_is_active(self) -> None:
+        source = {"id": "grok-immediate", "email": "immediate@example.com", "password": "password"}
+        completed = threading.Event()
+
+        async def run(job_id: str, _selected: dict[str, object], *, notify_failure: bool = True) -> None:
+            self.service._update_protocol_job(job_id, status="authorized", stage="completed")
+            completed.set()
+
+        with patch.object(self.service, "_select_protocol_source_account", return_value=source), patch.object(
+            self.service,
+            "_run_protocol_authorization",
+            new=run,
+        ):
+            started = self.service.start_protocol_authorization_background("grok-immediate")
+            finished = await asyncio.to_thread(completed.wait, 2)
+
+        self.assertTrue(finished)
+        self.assertEqual(self.service.get_protocol_authorization_job(started["job"]["id"])["status"], "authorized")
+
+    def test_protocol_queue_orders_registration_then_backfill_then_retry(self) -> None:
+        recovery = {"id": "grok-recovery", "email": "recovery@example.com", "password": "password"}
+        backfill = {"id": "grok-backfill", "email": "backfill@example.com", "password": "password"}
+        registered = {"id": "grok-registered", "email": "registered@example.com", "password": "password"}
+
+        with patch.object(
+            self.service,
+            "_select_protocol_source_account",
+            side_effect=[recovery, backfill, registered],
+        ), patch.object(self.service, "_ensure_protocol_workers"):
+            recovery_job = self.service.start_protocol_authorization_background("grok-recovery", retry=True)
+            backfill_job = self.service.start_protocol_authorization_background("grok-backfill")
+            registered_job = self.service.start_protocol_authorization_background(
+                "grok-registered",
+                prioritize=True,
+            )
+
+        first = self.service._protocol_queue.get_nowait()
+        second = self.service._protocol_queue.get_nowait()
+        third = self.service._protocol_queue.get_nowait()
+        self.assertEqual(first[2], registered_job["job"]["id"])
+        self.assertEqual(second[2], backfill_job["job"]["id"])
+        self.assertEqual(third[2], recovery_job["job"]["id"])
+        self.assertEqual(registered_job["priority"], "registration")
+        self.assertEqual(backfill_job["priority"], "backfill")
+        self.assertEqual(recovery_job["priority"], "retry")
+
+    def test_protocol_queue_status_reports_priority_counts(self) -> None:
+        self.service._protocol_queue.put((0, 1, "registration", {}))
+        self.service._protocol_queue.put((10, 2, "backfill", {}))
+        self.service._protocol_queue.put((20, 3, "retry", {}))
+
+        status = self.service.protocol_queue_status()
+
+        self.assertEqual(status["queued"], 3)
+        self.assertEqual(status["registration"], 1)
+        self.assertEqual(status["backfill"], 1)
+        self.assertEqual(status["retry"], 1)
+
+    def test_protocol_worker_limit_is_three(self) -> None:
+        self.assertEqual(self.service._protocol_worker_limit(), 3)
 
     def test_oauth_reuses_registration_upstream_proxy(self) -> None:
         profile = SimpleNamespace(proxy_url="socks5h://proxy.example:1080")
@@ -337,6 +489,110 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         by_id = {item["id"]: item for item in self.store.list_accounts()}
         self.assertEqual(by_id[first["id"]]["use_count"], 0)
         self.assertEqual(by_id[second["id"]]["use_count"], 1)
+
+    async def test_background_probe_persists_grok_45_quota_without_counting_user_traffic(self) -> None:
+        account = self._account()
+        upstream = httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit-requests": "21",
+                "x-ratelimit-remaining-requests": "20",
+                "x-ratelimit-limit-tokens": "1000000",
+                "x-ratelimit-remaining-tokens": "999786",
+            },
+            json={
+                "id": "resp_probe",
+                "usage": {"input_tokens": 196, "output_tokens": 18, "total_tokens": 214},
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}],
+            },
+        )
+
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)):
+            result = await self.service.probe_account(str(account["id"]))
+
+        self.assertEqual(result["status"], "valid")
+        saved = self.store.get(str(account["id"]), redacted=True)
+        self.assertEqual(saved["probe"]["model"], "grok-4.5")
+        self.assertEqual(saved["probe"]["usage"]["total_tokens"], 214)
+        self.assertEqual(saved["quota"]["requests"], {"limit": 21, "remaining": 20})
+        self.assertEqual(saved["quota"]["tokens"], {"limit": 1000000, "remaining": 999786})
+        self.assertEqual(saved["use_count"], 0)
+        self.assertEqual(saved["fail_count"], 0)
+
+    async def test_background_probe_marks_personal_team_blocked_oauth_invalid(self) -> None:
+        account = self._account()
+        upstream = httpx.Response(
+            402,
+            json={"error": {"code": "personal-team-blocked", "message": "Personal team is blocked"}},
+        )
+
+        with patch.object(self.service, "_post_response", new=AsyncMock(return_value=upstream)):
+            result = await self.service.probe_account(str(account["id"]))
+
+        self.assertEqual(result["status"], "invalid")
+        saved = self.store.get(str(account["id"]), redacted=True)
+        self.assertEqual(saved["status"], "invalid")
+        self.assertEqual(saved["probe"]["http_status"], 402)
+        self.assertEqual(saved["probe"]["code"], "personal-team-blocked")
+
+    async def test_sync_models_delivers_account_after_delayed_probe_becomes_valid(self) -> None:
+        account = self._account()
+        delivery = {
+            "sub2api": {"status": "success", "target_id": "server-one"},
+            "cpa": {"status": "skipped", "target_id": ""},
+        }
+        with patch.object(
+            self.service,
+            "_fetch_models",
+            new=AsyncMock(return_value=["grok-4.5"]),
+        ), patch.object(
+            self.service,
+            "probe_account",
+            new=AsyncMock(return_value={"status": "valid"}),
+        ), patch(
+            "services.register_service.register_service.get",
+            return_value={
+                "grok": {
+                    "oauth_delivery": {
+                        "sub2api": {"enabled": True, "server_id": "server-one"},
+                        "cpa": {"enabled": False},
+                    }
+                }
+            },
+        ), patch(
+            "services.xai_oauth_delivery_service.deliver_xai_oauth_account",
+            return_value=delivery,
+        ) as deliver:
+            result = await self.service.sync_models(str(account["id"]))
+
+        self.assertEqual(result["delivery"]["sub2api"]["status"], "success")
+        saved = self.store.get(str(account["id"]), redacted=True)
+        self.assertEqual(saved["metadata"]["oauth_delivery"]["sub2api"]["status"], "success")
+        deliver.assert_called_once()
+
+    async def test_delayed_delivery_skips_already_successful_target(self) -> None:
+        account = self._account()
+        self.store.update_metadata(
+            str(account["id"]),
+            {"oauth_delivery": {"sub2api": {"status": "success", "target_id": "server-one"}}},
+        )
+        with patch(
+            "services.register_service.register_service.get",
+            return_value={
+                "grok": {
+                    "oauth_delivery": {
+                        "sub2api": {"enabled": True, "server_id": "server-one"},
+                        "cpa": {"enabled": False},
+                    }
+                }
+            },
+        ), patch(
+            "services.xai_oauth_delivery_service.deliver_xai_oauth_account",
+        ) as deliver:
+            result = await self.service._deliver_oauth_if_needed(str(account["id"]))
+
+        self.assertEqual(result["sub2api"]["status"], "success")
+        deliver.assert_not_called()
 
     async def test_stream_request_reports_selected_account_when_iteration_starts(self) -> None:
         account = self._account()

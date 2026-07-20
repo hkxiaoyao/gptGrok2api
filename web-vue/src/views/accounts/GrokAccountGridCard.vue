@@ -33,12 +33,23 @@
         :tone-class="`${grokRuntimeStatusClass(item)} border-border`"
         :title="grokRefreshStatusTitle(item)"
       />
+      <StatusPill
+        v-if="item.probe_status"
+        :label="grokProbeStatusText(item)"
+        :tone-class="`${grokProbeStatusClass(item)} border-border`"
+        :title="grokProbeStatusTitle(item)"
+      />
+      <StatusPill
+        v-if="item.recovery_status"
+        :label="grokRecoveryStatusText(item)"
+        :tone-class="`${grokRecoveryStatusClass(item)} border-border`"
+        :title="grokRecoveryStatusTitle(item)"
+      />
       <StatusPill :label="grokSyncStateText(item)" tone-class="border-muted bg-muted/20 text-muted-foreground" />
       <StatusPill
-        v-if="item.oauth"
         :label="grokOAuthStatusText(item)"
         :tone-class="`${grokOAuthStatusClass(item)} border-border`"
-        :title="item.oauth.models.length ? `OAuth 模型：${item.oauth.models.join('、')}` : '已关联 OAuth 凭据'"
+        :title="grokOAuthStatusTitle(item)"
       />
     </div>
 
@@ -88,6 +99,13 @@ import {
   grokAccountTokenPreview,
   grokOAuthStatusClass,
   grokOAuthStatusText,
+  grokOAuthStatusTitle,
+  grokProbeStatusClass,
+  grokProbeStatusText,
+  grokProbeStatusTitle,
+  grokRecoveryStatusClass,
+  grokRecoveryStatusText,
+  grokRecoveryStatusTitle,
   grokRefreshStatusTitle,
   grokRuntimeStatusClass,
   grokRuntimeStatusText,

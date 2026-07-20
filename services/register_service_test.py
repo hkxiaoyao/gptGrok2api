@@ -915,7 +915,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
         disabled = _normalize({"target": "grok", "grok": {"xai_cli_oauth_enabled": False}})
         self.assertFalse(disabled["grok"]["xai_cli_oauth_enabled"])
 
-    def test_grok_runtime_reserves_one_solver_slot_for_immediate_oauth(self) -> None:
+    def test_grok_runtime_keeps_configured_solver_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store_file = Path(temp_dir) / "register.json"
             store_file.write_text(
@@ -936,7 +936,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
 
             runtime = service._runtime_config("grok")
 
-        self.assertEqual(runtime["grok"]["local_concurrency"], 4)
+        self.assertEqual(runtime["grok"]["local_concurrency"], 3)
         self.assertEqual(service.get()["grok"]["local_concurrency"], 3)
 
     def test_successful_grok_registration_starts_default_oauth_protocol(self) -> None:
@@ -958,7 +958,8 @@ class RegisterServiceGrokTest(unittest.TestCase):
             )
             account_store = GrokAccountStore(Path(temp_dir) / "grok_accounts.json")
 
-            def start_protocol(account_id: str) -> dict[str, object]:
+            def start_protocol(account_id: str, *, prioritize: bool = False) -> dict[str, object]:
+                self.assertTrue(prioritize)
                 protocol_calls.append(account_id)
                 return {"reused": False, "job": {"id": "xai-protocol-test"}}
 

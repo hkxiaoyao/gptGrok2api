@@ -110,6 +110,9 @@ def _log_solve(type_: str, sitekey: Optional[str], url: str, result: dict):
         "queue_wait": result.get("queue_wait"),
         "concurrency": result.get("concurrency"),
         "clicks": result.get("clicks"),
+        "widget_frames": result.get("widget_frames"),
+        "widget_visible": result.get("widget_visible"),
+        "widget_rebuilt": result.get("widget_rebuilt"),
         "timestamp": time.time(),
         "success": solved and not result.get("error"),
     })

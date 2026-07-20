@@ -11,21 +11,13 @@
       />
     </td>
     <td class="py-4 pr-5 align-middle">
-      <p class="max-w-[18rem] truncate text-sm font-medium text-foreground">{{ item.email || '-' }}</p>
-      <p class="mt-1 max-w-[18rem] truncate font-mono text-xs text-muted-foreground" :title="item.id">
+      <p class="max-w-[11rem] truncate text-sm font-medium text-foreground">{{ item.email || '-' }}</p>
+      <p class="mt-1 max-w-[11rem] truncate font-mono text-xs text-muted-foreground" :title="item.id">
         {{ grokAccountTokenPreview(item) }}
       </p>
     </td>
     <td class="py-4 pr-5 align-middle">
-      <div class="flex flex-wrap items-center gap-1.5">
-        <p class="text-xs font-medium text-foreground">{{ grokAccountPoolText(item) }}</p>
-        <StatusPill
-          v-if="item.oauth"
-          :label="grokOAuthStatusText(item)"
-          :tone-class="`${grokOAuthStatusClass(item)} border-border`"
-          :title="item.oauth.models.length ? `OAuth 模型：${item.oauth.models.join('、')}` : '已关联 OAuth 凭据'"
-        />
-      </div>
+      <p class="text-xs font-medium text-foreground">{{ grokAccountPoolText(item) }}</p>
       <p class="mt-1 text-xs text-muted-foreground">{{ grokSyncStateText(item) }}</p>
     </td>
     <td class="py-4 pr-5 align-middle">
@@ -35,17 +27,73 @@
       />
     </td>
     <td class="py-4 pr-5 align-middle">
-      <StatusPill
-        :label="grokRuntimeStatusText(item)"
-        :tone-class="`${grokRuntimeStatusClass(item)} border-border`"
-        :title="grokRefreshStatusTitle(item)"
-      />
+      <div class="flex flex-col items-start gap-1">
+        <StatusPill
+          :label="grokRuntimeStatusText(item)"
+          :tone-class="`${grokRuntimeStatusClass(item)} border-border`"
+          :title="grokRefreshStatusTitle(item)"
+        />
+        <StatusPill
+          v-if="item.probe_status"
+          :label="grokProbeStatusText(item)"
+          :tone-class="`${grokProbeStatusClass(item)} border-border`"
+          :title="grokProbeStatusTitle(item)"
+        />
+      </div>
       <p v-if="grokRefreshFailed(item)" class="mt-1 max-w-[12rem] truncate text-xs text-amber-600" :title="grokRefreshStatusTitle(item)">
         {{ item.refresh_error || '上游未返回真实额度数据' }}
       </p>
     </td>
     <td class="max-w-[18rem] py-4 pr-5 align-middle font-mono text-xs text-muted-foreground">
       <span class="whitespace-normal leading-5">{{ grokQuotaText(item) }}</span>
+    </td>
+    <td class="py-4 pr-5 align-middle">
+      <StatusPill
+        :label="grokOAuthShortStatusText(item)"
+        :tone-class="`${grokOAuthStatusClass(item)} border-border`"
+        :title="grokOAuthStatusTitle(item)"
+      />
+      <template v-if="item.oauth">
+        <p class="mt-1 max-w-[7.5rem] truncate font-mono text-[11px] text-muted-foreground">{{ item.oauth.probe?.model || item.oauth.models?.[0] || 'grok-4.5' }}</p>
+        <p v-if="item.oauth.probe?.at" class="mt-1 whitespace-nowrap text-[11px] text-muted-foreground">
+          {{ formatGrokAccountDate(item.oauth.probe.at) }}
+        </p>
+        <p
+          v-if="grokOAuthRecoveryStatusText(item)"
+          class="mt-1 text-[11px] font-medium"
+          :class="grokOAuthRecoveryStatusClass(item)"
+          :title="grokOAuthRecoveryStatusTitle(item)"
+        >
+          {{ grokOAuthRecoveryStatusText(item) }}
+        </p>
+      </template>
+    </td>
+    <td class="py-4 pr-5 align-middle">
+      <template v-if="item.oauth">
+        <div class="grid gap-1 font-mono text-xs tabular-nums">
+          <p class="grid grid-cols-[3.5rem_1fr] gap-2">
+            <span class="text-muted-foreground">请求</span>
+            <span class="text-foreground">{{ grokOAuthRequestQuotaText(item) }}</span>
+          </p>
+          <p class="grid grid-cols-[3.5rem_1fr] gap-2">
+            <span class="text-muted-foreground">Token</span>
+            <span class="text-foreground">{{ grokOAuthTokenQuotaText(item) }}</span>
+          </p>
+        </div>
+      </template>
+      <span v-else class="text-xs text-muted-foreground">-</span>
+    </td>
+    <td
+      class="py-4 pr-5 align-middle text-xs text-muted-foreground"
+      :title="grokOAuthRecoveryStatusTitle(item) || grokRecoveryStatusTitle(item)"
+    >
+      <p class="whitespace-nowrap">{{ grokRecoveryTimeText(item) }}</p>
+      <StatusPill
+        v-if="item.recovery_status"
+        class="mt-1"
+        :label="grokRecoveryStatusText(item)"
+        :tone-class="`${grokRecoveryStatusClass(item)} border-border`"
+      />
     </td>
     <td class="py-4 pr-5 align-middle">
       <p class="font-mono text-sm tabular-nums">
@@ -62,7 +110,7 @@
     <td class="py-4 pr-5 align-middle text-xs text-muted-foreground">
       {{ formatGrokAccountDate(item.last_used_at) }}
     </td>
-    <td class="py-4 text-right align-middle">
+    <td class="w-[16rem] py-4 text-right align-middle">
       <GrokAccountActionButtons
         :item="item"
         :runtime-available="runtimeAvailable"
@@ -107,10 +155,23 @@ import {
   grokAccountStatusText,
   grokAccountTokenPreview,
   grokQuotaText,
+  grokRecoveryStatusClass,
+  grokRecoveryStatusText,
+  grokRecoveryStatusTitle,
+  grokRecoveryTimeText,
   grokRefreshFailed,
   grokRefreshStatusTitle,
   grokOAuthStatusClass,
-  grokOAuthStatusText,
+  grokOAuthRequestQuotaText,
+  grokOAuthRecoveryStatusClass,
+  grokOAuthRecoveryStatusText,
+  grokOAuthRecoveryStatusTitle,
+  grokOAuthShortStatusText,
+  grokOAuthStatusTitle,
+  grokOAuthTokenQuotaText,
+  grokProbeStatusClass,
+  grokProbeStatusText,
+  grokProbeStatusTitle,
   grokRuntimeStatusClass,
   grokRuntimeStatusText,
   grokSuccessRate,

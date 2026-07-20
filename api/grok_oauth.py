@@ -121,6 +121,10 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "协议授权任务不存在或已过期"})
         return {"job": job}
 
+    @router.get("/protocol/status")
+    async def get_protocol_queue_status() -> dict[str, Any]:
+        return {"queue": xai_cli_oauth_service.protocol_queue_status()}
+
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str) -> dict[str, Any]:
         return await xai_cli_oauth_service.refresh_account(account_id)

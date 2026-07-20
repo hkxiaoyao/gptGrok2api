@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.7 - 2026-07-20
+
++ [新增] Grok SSO 与 OAuth 后台探测：服务启动后按周期分批验证运行池账号和真实 `grok-4.5` 能力，持久化有效、限流、失效、未知、请求额度和 Token 额度。
++ [新增] Grok 异常账号自动恢复：SSO 明确失效时使用已保存邮箱和密码重新登录，新 SSO 验证成功后才替换旧值；OAuth 未授权或失效时自动重新授权，并在恢复后补传 NovaApi/CPA。
++ [优化] Grok OAuth 协议队列升级为 3 worker 优先级队列，新注册优先于未授权回填和失败重试；新增队列状态接口，账号恢复支持任务复用和启动遗留任务回收。
++ [修复] 新 OAuth 返回 `permission-denied` 时不再误判封禁或重复完整授权；改为权限待生效状态，每 15 分钟以 3 并发复检 `grok-4.5`，转为有效后立即补传尚未成功的外部目标。
++ [优化] Grok 账号页合并展示 SSO/OAuth 状态、真实额度、最近探测、恢复状态和下次重试时间；移除重复的 `Grok Runtime` 侧栏入口，旧地址自动跳转到 Grok 账号视图。
++ [修复] 本地 Turnstile Solver 优先复用实页可见控件，必要时显式加载、重建稳定尺寸 widget，并记录 iframe 可见性和失败阶段，改善页面无可点击挑战时的诊断与成功率。
++ [修复] OpenAI `PlatformRegistrar` 正确区分新注册、已有账号和已停用账号；OTP 已直接进入 OAuth callback 时跳过资料创建，并将不可注册邮箱写回 GPT 标签后自动更换。
++ [文档] 更新 README、macOS/Ubuntu、NovaApi/CPA 自动上传和日志排错说明，对齐 3-worker OAuth、权限延迟复检、后台恢复和当前 solver 并发模型。
+
 ## 1.0.6 - 2026-07-20
 
 + [新增] macOS 本地 Captcha Solver 支持 Docker/Xvfb 运行有头 Chromium，浏览器不再弹到桌面，并提供 Compose、缓存持久化和一键启动脚本。

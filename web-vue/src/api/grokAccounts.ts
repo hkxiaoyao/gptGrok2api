@@ -9,7 +9,7 @@ export type GrokAccountStatus =
   | 'submission_failed'
   | 'submission_unknown'
   | 'submission_unconfirmed'
-export type GrokAccountStatusFilter = 'all' | GrokAccountStatus | 'normal' | 'limited' | 'abnormal' | 'disabled' | 'refresh_failed'
+export type GrokAccountStatusFilter = 'all' | GrokAccountStatus | 'normal' | 'limited' | 'abnormal' | 'disabled' | 'refresh_failed' | 'probe_invalid' | 'probe_unknown'
 export type GrokAccountExportFormat = 'json' | 'txt'
 export type GrokAccountSyncState =
   | 'synced'
@@ -20,6 +20,7 @@ export type GrokAccountSyncState =
   | 'failed'
   | 'unknown'
 export type GrokRuntimeStatus = 'active' | 'cooling' | 'rate_limited' | 'invalid' | 'expired' | 'disabled' | (string & {})
+export type GrokRecoveryStatus = 'pending' | 'running' | 'success' | 'failed'
 export type GrokQuotaMode = 'auto' | 'fast' | 'expert' | 'heavy' | 'console'
 
 export type GrokQuotaWindow = {
@@ -41,9 +42,11 @@ export type GrokAccountsSummary = {
   runtime_total?: number
   oauth_total?: number
   oauth_linked?: number
+  oauth_status?: Partial<Record<'unauthorized' | 'normal' | 'limited' | 'expired' | 'invalid', number>>
   runtime_status?: Partial<Record<'active' | 'cooling' | 'invalid' | 'disabled', number>>
   calls_total?: number
   quota?: Partial<Record<GrokQuotaMode, number>>
+  probe?: Partial<Record<GrokAccountVerificationStatus, number>>
 }
 
 export type GrokAccount = {
@@ -66,6 +69,16 @@ export type GrokAccount = {
   refresh_status?: 'success' | 'failed' | (string & {})
   refresh_at?: string | number | null
   refresh_error?: string
+  probe_status?: GrokAccountVerificationStatus | (string & {})
+  probe_at?: string | number | null
+  probe_quota?: GrokQuotaWindow | null
+  probe_error?: string
+  recovery_status?: GrokRecoveryStatus | (string & {})
+  recovery_last_attempt_at?: string | number | null
+  recovery_last_success_at?: string | number | null
+  recovery_next_attempt_at?: string | number | null
+  recovery_error?: string
+  recovery_attempts?: number
   tags?: string[]
   sync_state?: GrokAccountSyncState
   oauth?: GrokOAuthAccount | null
@@ -166,44 +179,6 @@ export type GrokAccountChatTestResponse = {
   elapsed_ms: number
 }
 
-export type GrokAccountsBatchChatTestSummary = {
-  total: number
-  success: number
-  blocked: number
-  invalid: number
-  limited: number
-  permission: number
-  failed: number
-  skipped: number
-}
-
-export type GrokAccountsBatchChatTestStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
-
-export type GrokAccountsBatchChatTestResult = {
-  id: string
-  status: string
-  model?: string
-  content?: string
-  elapsed_ms?: number
-  error?: string
-}
-
-export type GrokAccountsBatchChatTestJob = {
-  id: string
-  status: GrokAccountsBatchChatTestStatus | (string & {})
-  total: number
-  current: number
-  current_id?: string
-  cancel_requested?: boolean
-  summary: GrokAccountsBatchChatTestSummary
-  results: GrokAccountsBatchChatTestResult[]
-  error?: string
-}
-
-export type GrokAccountsBatchChatTestResponse = {
-  job: GrokAccountsBatchChatTestJob
-}
-
 const GROK_ACCOUNTS_PATH = '/api/register/grok/accounts'
 
 export const grokAccountsApi = {
@@ -249,25 +224,6 @@ export const grokAccountsApi = {
     return apiClient.post<GrokAccountChatTestRequest, GrokAccountChatTestResponse>(
       `${GROK_ACCOUNTS_PATH}/${encodeURIComponent(id)}/runtime/chat-test`,
       payload,
-    )
-  },
-
-  startBatchChatTest(payload: GrokAccountChatTestRequest) {
-    return apiClient.post<GrokAccountChatTestRequest, GrokAccountsBatchChatTestResponse>(
-      `${GROK_ACCOUNTS_PATH}/runtime/chat-test/batch`,
-      payload,
-    )
-  },
-
-  getBatchChatTestJob(jobId: string) {
-    return apiClient.get<never, GrokAccountsBatchChatTestResponse>(
-      `${GROK_ACCOUNTS_PATH}/runtime/chat-test/batch/${encodeURIComponent(jobId)}`,
-    )
-  },
-
-  cancelBatchChatTestJob(jobId: string) {
-    return apiClient.post<never, GrokAccountsBatchChatTestResponse>(
-      `${GROK_ACCOUNTS_PATH}/runtime/chat-test/batch/${encodeURIComponent(jobId)}/cancel`,
     )
   },
 

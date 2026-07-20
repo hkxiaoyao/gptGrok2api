@@ -197,37 +197,54 @@ async def solve_and_verify(sitekey: str, verify_url: str,
 
 # ── Real-page solver ────────────────────────────────────────────────
 
-# Sitekey is passed as the evaluate() arg `k` — never interpolated into JS source.
+# Sitekey is passed as the evaluate() arg `k` -- never interpolated into JS source.
 _WIDGET_INJECT_JS = (
-    "async ({k, a, c}) => {"
+    "async ({k, a, c, rebuild, timeoutMs}) => {"
+    "  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));"
+    "  const root = document.body || document.documentElement;"
+    "  if (!root) throw new Error('Turnstile page has no document root');"
     "  let d = document.querySelector('[data-captcha-solver-turnstile]');"
     "  if (!d) {"
     "    d = document.createElement('div');"
     "    d.setAttribute('data-captcha-solver-turnstile', '1');"
-    "    d.style.cssText = 'min-height:64px;position:fixed;left:20px;top:20px;z-index:2147483647';"
-    "    document.body.prepend(d);"
+    "    root.prepend(d);"
     "  }"
-    "  for (let i = 0; i < 100 && !window.turnstile?.render; i++) {"
-    "    await new Promise(resolve => setTimeout(resolve, 100));"
+    "  d.style.cssText = ["
+    "    'box-sizing:border-box', 'display:block', 'visibility:visible', 'opacity:1',"
+    "    'pointer-events:auto', 'overflow:visible', 'width:320px', 'min-width:320px',"
+    "    'height:80px', 'min-height:80px', 'padding:7px 10px', 'background:#fff',"
+    "    'position:fixed', 'left:20px', 'top:20px', 'z-index:2147483647'"
+    "  ].join(';');"
+    "  if (rebuild && window.__captchaSolverTurnstileWidgetId && window.turnstile?.remove) {"
+    "    try { window.turnstile.remove(window.__captchaSolverTurnstileWidgetId); } catch (_) {}"
     "  }"
+    "  if (rebuild) d.replaceChildren();"
+    "  const limit = Date.now() + Math.max(1000, Number(timeoutMs) || 8000);"
+    "  if (!window.turnstile?.render && !document.querySelector('script[data-captcha-solver-turnstile-api]')) {"
+    "    const script = document.createElement('script');"
+    "    script.setAttribute('data-captcha-solver-turnstile-api', '1');"
+    "    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';"
+    "    script.async = true;"
+    "    script.defer = true;"
+    "    script.onerror = () => { window.__captchaSolverTurnstileScriptError = 'script-load-error'; };"
+    "    (document.head || root).appendChild(script);"
+    "  }"
+    "  while (Date.now() < limit && !window.turnstile?.render) await sleep(100);"
     "  if (!window.turnstile?.render) {"
-    "    await new Promise((resolve, reject) => {"
-    "      const callback = '__captchaSolverTurnstileReady';"
-    "      window[callback] = resolve;"
-    "      const script = document.createElement('script');"
-    "      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=' + callback;"
-    "      script.async = true;"
-    "      script.defer = true;"
-    "      script.onerror = () => reject(new Error('Turnstile script failed to load'));"
-    "      document.head.appendChild(script);"
-    "      setTimeout(() => reject(new Error('Turnstile script load timeout')), 15000);"
-    "    });"
+    "    throw new Error(window.__captchaSolverTurnstileScriptError || 'Turnstile script load timeout');"
     "  }"
     "  window.__captchaSolverTurnstileToken = '';"
     "  window.__captchaSolverTurnstileError = '';"
     "  const options = {"
     "    sitekey: k,"
-    "    size: 'flexible',"
+    "    size: 'normal',"
+    "    theme: 'light',"
+    "    appearance: 'always',"
+    "    execution: 'render',"
+    "    retry: 'auto',"
+    "    'retry-interval': 3000,"
+    "    'refresh-expired': 'auto',"
+    "    'refresh-timeout': 'auto',"
     "    callback: token => { window.__captchaSolverTurnstileToken = token; },"
     "    'error-callback': code => { window.__captchaSolverTurnstileError = String(code || 'error'); },"
     "    'expired-callback': () => { window.__captchaSolverTurnstileError = 'expired'; },"
@@ -236,7 +253,41 @@ _WIDGET_INJECT_JS = (
     "  if (a) options.action = a;"
     "  if (c) options.cData = c;"
     "  window.__captchaSolverTurnstileWidgetId = window.turnstile.render(d, options);"
-    "  return window.__captchaSolverTurnstileWidgetId;"
+    "  return String(window.__captchaSolverTurnstileWidgetId || '');"
+    "}"
+)
+
+_WIDGET_DIAGNOSTICS_JS = (
+    "() => {"
+    "  const visible = (el, box) => {"
+    "    const style = getComputedStyle(el);"
+    "    return box.width >= 80 && box.height >= 40 && style.display !== 'none' &&"
+    "      style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 &&"
+    "      box.bottom > 0 && box.right > 0 && box.top < innerHeight && box.left < innerWidth;"
+    "  };"
+    "  const frames = Array.from(document.querySelectorAll('iframe'))"
+    "    .filter(el => String(el.src || '').includes('challenges.cloudflare.com'))"
+    "    .map(el => {"
+    "      const box = el.getBoundingClientRect();"
+    "      return {"
+    "        width: Math.round(box.width), height: Math.round(box.height),"
+    "        x: Math.round(box.x), y: Math.round(box.y), visible: visible(el, box)"
+    "      };"
+    "    });"
+    "  const container = document.querySelector('[data-captcha-solver-turnstile]');"
+    "  const box = container?.getBoundingClientRect();"
+    "  return {"
+    "    turnstile: Boolean(window.turnstile?.render),"
+    "    widget_id: String(window.__captchaSolverTurnstileWidgetId || ''),"
+    "    frame_count: frames.length,"
+    "    visible_frames: frames.filter(item => item.visible).length,"
+    "    frames: frames.slice(0, 6),"
+    "    container: box ? {width: Math.round(box.width), height: Math.round(box.height),"
+    "      x: Math.round(box.x), y: Math.round(box.y)} : null,"
+    "    response_fields: document.querySelectorAll('[name=cf-turnstile-response]').length,"
+    "    page: location.origin + location.pathname,"
+    "    title: String(document.title || '').slice(0, 120)"
+    "  };"
     "}"
 )
 
@@ -254,14 +305,99 @@ _READ_TOKEN_JS = (
 )
 
 
+async def _read_widget_diagnostics(page) -> dict:
+    try:
+        state = await page.evaluate(_WIDGET_DIAGNOSTICS_JS)
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _merge_widget_diagnostics(target: dict, state: dict) -> None:
+    if not isinstance(state, dict):
+        return
+    for key, value in state.items():
+        if key in {"frame_count", "visible_frames", "response_fields"}:
+            target[key] = max(int(target.get(key) or 0), int(value or 0))
+        elif key in {"rebuilt", "reused_existing"}:
+            target[key] = bool(target.get(key)) or bool(value)
+        else:
+            target[key] = value
+
+
 async def _inject_turnstile_widget(page, sitekey: str, action: str = None,
-                                   cdata: str = None) -> None:
-    """Inject a .cf-turnstile widget with the sitekey passed as data (evaluate arg)."""
+                                   cdata: str = None, rebuild: bool = False,
+                                   load_timeout_s: float = 8) -> dict:
+    """Reuse a visible page widget, or render a stable visible widget of our own."""
+    before = await _read_widget_diagnostics(page)
+    if not rebuild and int(before.get("visible_frames") or 0) > 0:
+        before["reused_existing"] = True
+        before["rebuilt"] = False
+        return before
+
     await page.evaluate(_WIDGET_INJECT_JS, {
         "k": sitekey,
         "a": action or "",
         "c": cdata or "",
+        "rebuild": bool(rebuild),
+        "timeoutMs": max(1000, int(float(load_timeout_s) * 1000)),
     })
+    state = await _read_widget_diagnostics(page)
+    state["reused_existing"] = False
+    state["rebuilt"] = bool(rebuild)
+    return state
+
+
+async def _wait_for_visible_turnstile_widget(page, deadline: float) -> dict:
+    last = {}
+    while time.monotonic() < deadline:
+        last = await _read_widget_diagnostics(page)
+        if int(last.get("visible_frames") or 0) > 0:
+            return last
+        token, _error = await _read_turnstile_state(page)
+        if token:
+            return last
+        await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return last
+
+
+async def _ensure_turnstile_widget(page, sitekey: str, deadline: float,
+                                   action: str = None, cdata: str = None) -> dict:
+    """Make the widget visible when possible, rebuilding once if no iframe attaches."""
+    remaining = max(0.0, deadline - time.monotonic())
+    state = await _inject_turnstile_widget(
+        page, sitekey, action, cdata,
+        load_timeout_s=min(6.0, max(1.0, remaining * 0.35)),
+    )
+    remaining = max(0.0, deadline - time.monotonic())
+    visible_state = await _wait_for_visible_turnstile_widget(
+        page, min(deadline, time.monotonic() + min(4.0, max(0.5, remaining * 0.2)))
+    )
+    if visible_state:
+        state.update(visible_state)
+
+    token, _error = await _read_turnstile_state(page)
+    if int(state.get("visible_frames") or 0) > 0 or token:
+        state.setdefault("rebuilt", False)
+        return state
+
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining < 3.0:
+        state.setdefault("rebuilt", False)
+        return state
+
+    state = await _inject_turnstile_widget(
+        page, sitekey, action, cdata, rebuild=True,
+        load_timeout_s=min(4.0, max(1.0, remaining * 0.25)),
+    )
+    remaining = max(0.0, deadline - time.monotonic())
+    rebuilt_state = await _wait_for_visible_turnstile_widget(
+        page, min(deadline, time.monotonic() + min(3.0, max(0.5, remaining * 0.2)))
+    )
+    if rebuilt_state:
+        state.update(rebuilt_state)
+    state["rebuilt"] = True
+    return state
 
 
 async def _human_click_iframe(page, fr) -> bool:
@@ -305,7 +441,8 @@ async def _read_turnstile_state(page) -> tuple[str, str]:
     return str(state.get("token") or "").strip(), str(state.get("error") or "").strip()
 
 
-async def _wait_for_turnstile_token(page, deadline: float) -> tuple[str, int, str]:
+async def _wait_for_turnstile_token(page, deadline: float,
+                                    widget_state: dict = None) -> tuple[str, int, str]:
     """Poll callback/response fields and click only visible challenge frames."""
     clicks = 0
     last_error = ""
@@ -322,6 +459,13 @@ async def _wait_for_turnstile_token(page, deadline: float) -> tuple[str, int, st
             clicked = await _click_visible_turnstile_checkbox(page)
             if clicked:
                 clicks += 1
+                if widget_state is not None:
+                    widget_state["frame_count"] = max(
+                        1, int(widget_state.get("frame_count") or 0)
+                    )
+                    widget_state["visible_frames"] = max(
+                        1, int(widget_state.get("visible_frames") or 0)
+                    )
                 next_click_at = now + 8
             else:
                 next_click_at = now + 0.75
@@ -383,14 +527,36 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                     await run_pre_actions(page, pre_actions)
                     await asyncio.sleep(2)
 
-                # Inject sitekey widget if given (override page's own).
+                widget_state = {}
+                # Reuse a visible page widget first; otherwise inject one with a stable box.
                 if sitekey:
-                    await _inject_turnstile_widget(page, sitekey, action, cdata)
+                    widget_state = await _ensure_turnstile_widget(
+                        page, sitekey, deadline, action, cdata
+                    )
+                    log.info(
+                        "Real-page widget turnstile=%s frames=%d visible=%d "
+                        "reused=%s rebuilt=%s container=%s page=%s",
+                        bool(widget_state.get("turnstile")),
+                        int(widget_state.get("frame_count") or 0),
+                        int(widget_state.get("visible_frames") or 0),
+                        bool(widget_state.get("reused_existing")),
+                        bool(widget_state.get("rebuilt")),
+                        widget_state.get("container"),
+                        widget_state.get("page") or "unknown",
+                    )
 
-                token, clicks, challenge_error = await _wait_for_turnstile_token(page, deadline)
+                token, clicks, challenge_error = await _wait_for_turnstile_token(
+                    page, deadline, widget_state
+                )
+                final_widget_state = await _read_widget_diagnostics(page)
+                _merge_widget_diagnostics(widget_state, final_widget_state)
                 log.info(
-                    "Real-page result token=%s clicks=%d queue_wait=%.1fs challenge_error=%s",
-                    bool(token), clicks, queue_wait, challenge_error or "none",
+                    "Real-page result token=%s clicks=%d frames=%d visible=%d "
+                    "queue_wait=%.1fs challenge_error=%s",
+                    bool(token), clicks,
+                    int(widget_state.get("frame_count") or 0),
+                    int(widget_state.get("visible_frames") or 0),
+                    queue_wait, challenge_error or "none",
                 )
 
                 cookies = await page.context.cookies()
@@ -401,9 +567,17 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                           "elapsed": round(time.monotonic() - t0, 1),
                           "queue_wait": round(queue_wait, 1),
                           "concurrency": limit,
-                          "clicks": clicks}
+                          "clicks": clicks,
+                          "widget_frames": int(widget_state.get("frame_count") or 0),
+                          "widget_visible": int(widget_state.get("visible_frames") or 0),
+                          "widget_rebuilt": bool(widget_state.get("rebuilt"))}
                 if not token:
-                    result["error"] = challenge_error or "Turnstile token not received before deadline"
+                    if not result["widget_visible"]:
+                        result["phase"] = "widget"
+                        result["error"] = challenge_error or "Turnstile widget did not become visible before deadline"
+                    else:
+                        result["phase"] = "challenge"
+                        result["error"] = challenge_error or "Turnstile token not received before deadline"
 
                 # Post_fetch from the same session (parameterized — injection-safe).
                 if post_fetch and token:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from services.xai_device_oauth_protocol import (
     XaiDeviceOAuthProtocol,
@@ -119,6 +121,49 @@ class DeviceConsentFormTest(unittest.TestCase):
 
         direct = XaiDeviceOAuthProtocol({}, proxy="direct")
         self.assertNotIn("proxy", direct._turnstile_solver_config())
+
+    def test_password_login_can_return_grok_sso_without_device_consent(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client.base_url = "https://accounts.x.ai"
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        client.create_castle_token.return_value = "castle-token"
+        client._cookie_value_for_domain.return_value = "new-sso-token"
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/sign-in"},
+            ),
+            response(url="https://accounts.x.ai/sign-in"),
+            response(payload={"cookieSetterUrl": "https://grok.com/auth/callback"}),
+            response(url="https://grok.com/"),
+        ]
+        solver = MagicMock()
+        solver.solve.return_value = "turnstile-token"
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client), patch(
+            "services.xai_device_oauth_protocol.TurnstileSolver",
+            return_value=solver,
+        ):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="password",
+                sso_only=True,
+            )
+
+        self.assertEqual(result, {"sso": "new-sso-token"})
+        self.assertEqual(client._request.call_count, 5)
+        solver.close.assert_called_once_with()
+        client.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

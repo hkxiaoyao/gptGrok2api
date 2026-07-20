@@ -27,9 +27,11 @@ from services.json_file import read_json_file
 
 XAI_CLI_OAUTH_ACCOUNTS_FILE = DATA_DIR / "xai_cli_oauth_accounts.json"
 XAI_CLI_OAUTH_PROVIDER = "xai_cli_oauth"
-XAI_CLI_OAUTH_SCHEMA_VERSION = 1
+XAI_CLI_OAUTH_SCHEMA_VERSION = 2
 
 _STATUSES = frozenset({"active", "disabled", "expired", "invalid"})
+_PROBE_STATUSES = frozenset({"valid", "limited", "invalid", "unknown"})
+_RECOVERY_STATUSES = frozenset({"pending", "running", "success", "failed"})
 _SECRET_METADATA_KEYS = frozenset(
     {
         "access_token",
@@ -154,6 +156,82 @@ def _non_negative_int(value: object) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _optional_non_negative_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _quota_snapshot(value: object) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for key in ("requests", "tokens"):
+        raw_window = source.get(key)
+        if not isinstance(raw_window, dict):
+            continue
+        limit = _optional_non_negative_int(raw_window.get("limit"))
+        remaining = _optional_non_negative_int(raw_window.get("remaining"))
+        if limit is None and remaining is None:
+            continue
+        window: dict[str, Any] = {}
+        if limit is not None:
+            window["limit"] = limit
+        if remaining is not None:
+            window["remaining"] = remaining
+        reset = _clean_text(raw_window.get("reset"))[:100]
+        if reset:
+            window["reset"] = reset
+        result[key] = window
+    updated_at = _clean_text(source.get("updated_at"))
+    if result and updated_at:
+        result["updated_at"] = updated_at
+    return result
+
+
+def _probe_snapshot(value: object) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    status = _clean_text(source.get("status")).lower()
+    if status not in _PROBE_STATUSES:
+        return {}
+    result: dict[str, Any] = {
+        "status": status,
+        "at": _clean_text(source.get("at")),
+        "model": _clean_text(source.get("model")),
+        "http_status": _non_negative_int(source.get("http_status")),
+        "code": _clean_text(source.get("code"))[:120],
+        "error": _clean_text(source.get("error"))[:500],
+    }
+    usage = source.get("usage") if isinstance(source.get("usage"), dict) else {}
+    normalized_usage = {
+        key: value
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cost_in_usd_ticks")
+        if (value := _optional_non_negative_int(usage.get(key))) is not None
+    }
+    if normalized_usage:
+        result["usage"] = normalized_usage
+    return result
+
+
+def _recovery_snapshot(value: object) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    status = _clean_text(source.get("status")).lower()
+    if status not in _RECOVERY_STATUSES:
+        return {}
+    return {
+        "status": status,
+        "job_id": _clean_text(source.get("job_id"))[:160],
+        "source_account_id": _clean_text(source.get("source_account_id"))[:160],
+        "last_attempt_at": _clean_text(source.get("last_attempt_at")),
+        "last_success_at": _clean_text(source.get("last_success_at")),
+        "next_attempt_at": _clean_text(source.get("next_attempt_at")),
+        "attempts": _non_negative_int(source.get("attempts")),
+        "error": _clean_text(source.get("error"))[:500],
+    }
 
 
 def _safe_error(value: object, item: dict[str, Any]) -> str:
@@ -299,6 +377,9 @@ class XaiCliOAuthAccountStore:
             "source_type": _clean_text(item.get("source_type")) or "oauth_import",
             "metadata": metadata if isinstance(metadata, dict) else {},
             "models": _model_ids(item.get("models", item.get("available_models", []))),
+            "probe": _probe_snapshot(item.get("probe")),
+            "quota": _quota_snapshot(item.get("quota")),
+            "recovery": _recovery_snapshot(item.get("recovery")),
             "use_count": 0,
             "fail_count": 0,
             "last_used_at": "",
@@ -314,7 +395,18 @@ class XaiCliOAuthAccountStore:
         for key, value in incoming.items():
             if key in {"id", "created_at", "use_count", "fail_count", "last_used_at", "last_error"}:
                 continue
-            if key in {"email", "subject", "access_token", "id_token", "expires_at", "metadata", "models"} and not value:
+            if key in {
+                "email",
+                "subject",
+                "access_token",
+                "id_token",
+                "expires_at",
+                "metadata",
+                "models",
+                "probe",
+                "quota",
+                "recovery",
+            } and not value:
                 continue
             merged[key] = copy.deepcopy(value)
         merged["id"] = _clean_text(existing.get("id")) or incoming["id"]
@@ -388,6 +480,9 @@ class XaiCliOAuthAccountStore:
             "source_type": _clean_text(item.get("source_type")) or "oauth_import",
             "metadata": _safe_metadata(item.get("metadata")) if isinstance(item.get("metadata"), dict) else {},
             "models": _model_ids(item.get("models")),
+            "probe": _probe_snapshot(item.get("probe")),
+            "quota": _quota_snapshot(item.get("quota")),
+            "recovery": _recovery_snapshot(item.get("recovery")),
             "use_count": _non_negative_int(item.get("use_count")),
             "fail_count": _non_negative_int(item.get("fail_count")),
             "last_used_at": _clean_text(item.get("last_used_at")),
@@ -606,6 +701,166 @@ class XaiCliOAuthAccountStore:
                 self._save_unlocked(items)
                 return self._redacted(item)
         return None
+
+    def update_probe_result(
+        self,
+        account_id: str,
+        *,
+        status: str,
+        model: str,
+        http_status: int = 0,
+        code: str = "",
+        error: str = "",
+        quota: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+        probed_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Persist one real ``grok-4.5`` probe without counting it as user traffic."""
+        updated = self.update_probe_results(
+            [
+                {
+                    "account_id": account_id,
+                    "status": status,
+                    "model": model,
+                    "http_status": http_status,
+                    "code": code,
+                    "error": error,
+                    "quota": quota,
+                    "usage": usage,
+                    "probed_at": probed_at,
+                }
+            ]
+        )
+        return updated[0] if updated else None
+
+    def update_probe_results(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Persist a probe batch with one atomic account-file rewrite."""
+        source_results = [item for item in results if isinstance(item, dict)]
+        if not source_results:
+            return []
+        for result in source_results:
+            target_id = _clean_text(result.get("account_id") or result.get("id"))
+            normalized_status = _clean_text(result.get("status")).lower()
+            if not target_id:
+                raise ValueError("account_id is required")
+            if normalized_status not in _PROBE_STATUSES:
+                choices = ", ".join(sorted(_PROBE_STATUSES))
+                raise ValueError(f"xAI CLI OAuth probe status must be one of: {choices}")
+
+        with self._lock:
+            items = self._load_unlocked()
+            by_id = {
+                _clean_text(item.get("id")): item
+                for item in items
+                if _clean_text(item.get("id"))
+            }
+            updated_items: list[dict[str, Any]] = []
+            now = _now()
+            for result in source_results:
+                target_id = _clean_text(result.get("account_id") or result.get("id"))
+                item = by_id.get(target_id)
+                if item is None:
+                    continue
+                normalized_status = _clean_text(result.get("status")).lower()
+                probed_at = _clean_text(result.get("probed_at")) or now
+                item["probe"] = _probe_snapshot(
+                    {
+                        "status": normalized_status,
+                        "at": probed_at,
+                        "model": _clean_text(result.get("model")),
+                        "http_status": result.get("http_status"),
+                        "code": _clean_text(result.get("code")),
+                        "error": _safe_error(result.get("error"), item),
+                        "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
+                    }
+                )
+                normalized_quota = _quota_snapshot(result.get("quota"))
+                if normalized_quota:
+                    normalized_quota["updated_at"] = probed_at
+                    item["quota"] = normalized_quota
+
+                current_status = _normalize_status(item.get("status"))
+                if current_status != "disabled":
+                    if normalized_status == "invalid":
+                        item["status"] = "invalid"
+                    elif normalized_status in {"valid", "limited"}:
+                        item["status"] = "active"
+                item["updated_at"] = now
+                updated_items.append(item)
+            if updated_items:
+                self._save_unlocked(items)
+            return [self._redacted(item) for item in updated_items]
+
+    def update_recovery_state(
+        self,
+        account_id: str,
+        *,
+        status: str,
+        job_id: str | None = None,
+        source_account_id: str | None = None,
+        last_attempt_at: str | None = None,
+        last_success_at: str | None = None,
+        next_attempt_at: str | None = None,
+        attempts: int | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any] | None:
+        target_id = _clean_text(account_id)
+        normalized_status = _clean_text(status).lower()
+        if not target_id:
+            raise ValueError("account_id is required")
+        if normalized_status not in _RECOVERY_STATUSES:
+            choices = ", ".join(sorted(_RECOVERY_STATUSES))
+            raise ValueError(f"xAI CLI OAuth recovery status must be one of: {choices}")
+
+        with self._lock:
+            items = self._load_unlocked()
+            for item in items:
+                if _clean_text(item.get("id")) != target_id:
+                    continue
+                recovery = dict(item.get("recovery")) if isinstance(item.get("recovery"), dict) else {}
+                recovery["status"] = normalized_status
+                if job_id is not None:
+                    recovery["job_id"] = _clean_text(job_id)[:160]
+                if source_account_id is not None:
+                    recovery["source_account_id"] = _clean_text(source_account_id)[:160]
+                if last_attempt_at is not None:
+                    recovery["last_attempt_at"] = _clean_text(last_attempt_at)
+                if last_success_at is not None:
+                    recovery["last_success_at"] = _clean_text(last_success_at)
+                if next_attempt_at is not None:
+                    recovery["next_attempt_at"] = _clean_text(next_attempt_at)
+                if attempts is not None:
+                    recovery["attempts"] = _non_negative_int(attempts)
+                if error is not None:
+                    recovery["error"] = _safe_error(error, item)
+                item["recovery"] = _recovery_snapshot(recovery)
+                item["updated_at"] = _now()
+                self._save_unlocked(items)
+                return self._redacted(item)
+        return None
+
+    def find_by_recovery_job_id(self, job_id: str, *, redacted: bool = False) -> dict[str, Any] | None:
+        target_job_id = _clean_text(job_id)
+        if not target_job_id:
+            return None
+        with self._lock:
+            item = next(
+                (
+                    current
+                    for current in self._load_unlocked()
+                    if _clean_text(
+                        current.get("recovery", {}).get("job_id")
+                        if isinstance(current.get("recovery"), dict)
+                        else ""
+                    )
+                    == target_job_id
+                ),
+                None,
+            )
+            if item is None:
+                return None
+            copied = copy.deepcopy(item)
+        return self._redacted(copied) if redacted else copied
 
     def set_status(self, ids: list[str], status: str) -> dict[str, int]:
         """Set a lifecycle status by stable store IDs only."""

@@ -196,44 +196,6 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "ids is required"})
         return await run_in_threadpool(register_service.verify_grok_accounts_runtime, ids)
 
-    @router.post("/api/register/grok/accounts/runtime/chat-test/batch")
-    async def chat_test_all_grok_accounts_runtime(
-        body: GrokAccountChatTestRequest,
-        authorization: str | None = Header(default=None),
-    ):
-        require_admin(authorization)
-        try:
-            started = await run_in_threadpool(
-                register_service.start_grok_accounts_chat_test_job,
-                prompt=body.prompt,
-                model=body.model,
-            )
-        except GrokAccountChatTestError as exc:
-            raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}) from exc
-        return {"job": started["job"]}
-
-    @router.get("/api/register/grok/accounts/runtime/chat-test/batch/{job_id}")
-    async def get_grok_accounts_chat_test_job(
-        job_id: str,
-        authorization: str | None = Header(default=None),
-    ):
-        require_admin(authorization)
-        job = await run_in_threadpool(register_service.get_grok_accounts_chat_test_job, job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail={"error": "批量 Console 对话测试任务不存在"})
-        return {"job": job}
-
-    @router.post("/api/register/grok/accounts/runtime/chat-test/batch/{job_id}/cancel")
-    async def cancel_grok_accounts_chat_test_job(
-        job_id: str,
-        authorization: str | None = Header(default=None),
-    ):
-        require_admin(authorization)
-        job = await run_in_threadpool(register_service.cancel_grok_accounts_chat_test_job, job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail={"error": "批量 Console 对话测试任务不存在"})
-        return {"job": job}
-
     @router.post("/api/register/grok/accounts/{account_id}/runtime/chat-test")
     async def chat_test_grok_account_runtime(
         account_id: str,

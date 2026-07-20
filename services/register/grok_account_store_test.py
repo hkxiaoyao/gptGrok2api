@@ -86,6 +86,85 @@ class GrokAccountStoreTest(unittest.TestCase):
         )
         self.assertNotIn("sso", credentials)
 
+    def test_probe_results_are_stored_without_credentials(self) -> None:
+        saved = self.store.upsert(
+            {"email": "user@example.com", "password": "password", "sso": "secret-token"}
+        )
+
+        result = self.store.update_probe_results(
+            [
+                {
+                    "id": saved["item"]["id"],
+                    "status": "valid",
+                    "quota": {"remaining": 4, "total": 10, "reset_at": 123},
+                },
+                {"id": "missing", "status": "invalid", "error": "not found"},
+            ],
+            probed_at="2026-07-20T00:00:00+00:00",
+        )
+
+        self.assertEqual(result, {"updated": 1, "missing": 1})
+        item = self.store.get_accounts_by_ids([saved["item"]["id"]])[0]
+        self.assertEqual(
+            item["probe"],
+            {
+                "status": "valid",
+                "at": "2026-07-20T00:00:00+00:00",
+                "quota": {"remaining": 4, "total": 10},
+            },
+        )
+        self.assertNotIn("secret-token", repr(item["probe"]))
+
+    def test_recovery_replaces_sso_by_stable_id_and_absorbs_runtime_mirror(self) -> None:
+        saved = self.store.upsert(
+            {
+                "email": "user@example.com",
+                "password": "password",
+                "sso": "old-token",
+                "source_type": "protocol",
+            }
+        )
+        self.store.update_recovery_state(
+            saved["item"]["id"],
+            status="running",
+            last_attempt_at="2026-07-20T01:00:00+00:00",
+            attempts=1,
+        )
+        self.store.reconcile_runtime_accounts(
+            [
+                {"token": "old-token", "status": "invalid", "pool": "auto"},
+                {"token": "new-token", "status": "active", "pool": "super"},
+            ]
+        )
+
+        result = self.store.replace_sso_after_recovery(
+            saved["item"]["id"],
+            expected_sso="old-token",
+            new_sso="new-token",
+            recovered_at="2026-07-20T02:00:00+00:00",
+            quota={"remaining": 8, "total": 10},
+        )
+
+        items = self.store.list_accounts(redacted=False)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(result["id"], saved["item"]["id"])
+        self.assertEqual(result["email"], "user@example.com")
+        self.assertEqual(result["password"], "password")
+        self.assertEqual(result["sso"], "new-token")
+        self.assertEqual(result["runtime"]["status"], "active")
+        self.assertEqual(result["runtime"]["pool"], "super")
+        self.assertEqual(
+            result["probe"],
+            {
+                "status": "valid",
+                "at": "2026-07-20T02:00:00+00:00",
+                "quota": {"remaining": 8, "total": 10},
+            },
+        )
+        self.assertEqual(result["recovery"]["status"], "success")
+        self.assertEqual(result["recovery"]["last_success_at"], "2026-07-20T02:00:00+00:00")
+        self.assertEqual(result["recovery"]["attempts"], 0)
+
     def test_runtime_identity_for_token_returns_only_log_safe_metadata(self) -> None:
         saved = self.store.upsert(
             {

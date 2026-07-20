@@ -175,9 +175,14 @@ class PasswordlessSignupUnavailable(RuntimeError):
 class OpenAIEmailAlreadyRegistered(RuntimeError):
     """OpenAI routed a signup address into the existing-account login flow."""
 
-    def __init__(self, email: str) -> None:
+    def __init__(self, email: str, *, reason: str = "existing_account") -> None:
         self.email = str(email or "").strip()
-        super().__init__(f"当前邮箱已进入 OpenAI 登录验证码分支，不能作为新账号继续注册: {self.email}")
+        self.reason = str(reason or "existing_account").strip() or "existing_account"
+        if self.reason == "account_deactivated":
+            message = f"当前邮箱对应的 OpenAI 账号已删除或停用: {self.email}"
+        else:
+            message = f"当前邮箱已进入 OpenAI 登录分支，不能作为新账号继续注册: {self.email}"
+        super().__init__(message)
 
 
 class OpenAIMailboxDeliveryTimeout(RuntimeError):
@@ -190,6 +195,11 @@ class OpenAIMailboxDeliveryTimeout(RuntimeError):
         self.label = str(mailbox.get("label") or self.provider or "邮箱来源").strip()
         self.reason = str(reason or "未收到验证码").strip()
         super().__init__(f"[{self.label}] {self.reason}")
+
+
+def _is_openai_account_deactivated_error(error: Exception | str | None) -> bool:
+    reason = str(error or "").strip().lower()
+    return "account_deactivated" in reason or "deleted or deactivated" in reason
 
 
 common_headers = {
@@ -1417,8 +1427,14 @@ class PlatformRegistrar:
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
 
-    def _authorize_continue_login(self, email: str, index: int) -> dict:
-        step(index, "提交 Microsoft 邮箱进入登录验证")
+    def _authorize_continue_login(self, email: str, mailbox: dict, index: int) -> dict:
+        provider = str(mailbox.get("provider") or "").strip().lower()
+        provider_label = {
+            "icloud_api": "iCloud 邮箱",
+            "icloud_local": "iCloud 邮箱",
+            "outlook_token": "Microsoft 邮箱",
+        }.get(provider, "当前邮箱")
+        step(index, f"提交 {provider_label}进入登录验证")
         url = f"{auth_base}/api/accounts/authorize/continue"
 
         def send():
@@ -1484,7 +1500,7 @@ class PlatformRegistrar:
                 step(index, "OpenAI 登录会话失效，重新发起 passwordless 登录", "yellow")
                 self._reset_auth_cookies()
                 self._platform_authorize(email, index, screen_hint="login_or_signup")
-            self._authorize_continue_login(email, index)
+            self._authorize_continue_login(email, mailbox, index)
             mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
             self._send_passwordless_otp(index)
             step(index, "开始等待 OpenAI 登录验证码")
@@ -1596,7 +1612,7 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
 
-    def _validate_otp(self, code: str, index: int) -> None:
+    def _validate_otp(self, code: str, index: int) -> str:
         step(index, f"开始校验验证码 {code}")
         resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
         if resp is None or resp.status_code != 200:
@@ -1608,15 +1624,17 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         data = _response_json(resp)
         continue_url = extract_continue_url(data)
+        final_url = ""
         if continue_url:
             self.last_otp_continue_url = continue_url
-            self._authorize_continue(continue_url, index)
+            final_url = self._authorize_continue(continue_url, index)
         step(index, "验证码校验完成")
+        return final_url or continue_url
 
-    def _authorize_continue(self, continue_url: str, index: int) -> None:
+    def _authorize_continue(self, continue_url: str, index: int) -> str:
         url = str(continue_url or "").strip()
         if not url:
-            return
+            return ""
         if not url.lower().startswith(("http://", "https://")):
             url = urljoin(f"{auth_base}/", url.lstrip("/"))
 
@@ -1647,7 +1665,9 @@ class PlatformRegistrar:
                 error
                 or f"authorize_continue_http_{getattr(resp, 'status_code', 'unknown')}, {debug}"
             )
-        step(index, f"继续注册授权完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
+        final_url = str(getattr(resp, "url", "") or url).strip()
+        step(index, f"继续注册授权完成 url={final_url[:160]}")
+        return final_url
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
@@ -1789,8 +1809,7 @@ class PlatformRegistrar:
             landed = self._platform_authorize(email, index)
             source_type = "web"
             if landed == "login":
-                tokens = self._passwordless_login(email, mailbox, index)
-                source_type = "microsoft"
+                raise OpenAIEmailAlreadyRegistered(email)
             else:
                 if not self.passwordless_signup:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
@@ -1811,10 +1830,33 @@ class PlatformRegistrar:
                 if not code:
                     raise RuntimeError("等待注册验证码超时")
                 step(index, f"收到注册验证码: {code}")
-                self._validate_otp(code, index)
-                self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+                otp_final_url = self._validate_otp(code, index)
+                callback_params = extract_oauth_callback_params_from_url(otp_final_url)
+                callback_code = str((callback_params or {}).get("code") or "").strip()
+                if callback_code:
+                    self.platform_auth_code = callback_code
+
+                if self.platform_auth_code:
+                    step(index, "OTP 后已进入 OAuth callback，跳过账号资料创建")
+                else:
+                    otp_final_path = _url_path(otp_final_url).rstrip("/")
+                    if otp_final_url and otp_final_path != "/about-you":
+                        raise RuntimeError(
+                            "otp_unexpected_auth_step: "
+                            f"final={_safe_url_for_log(otp_final_url)}"
+                        )
+                    self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
                 tokens = self._exchange_registered_tokens(index)
+        except OpenAIEmailAlreadyRegistered:
+            mail_provider.mark_mailbox_result(mailbox, success=True)
+            raise
         except Exception as error:
+            if _is_openai_account_deactivated_error(error):
+                mail_provider.mark_mailbox_result(mailbox, success=True)
+                raise OpenAIEmailAlreadyRegistered(
+                    email,
+                    reason="account_deactivated",
+                ) from error
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
         mail_provider.mark_mailbox_result(mailbox, success=True)
@@ -2986,14 +3028,15 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
         except OpenAIEmailAlreadyRegistered as error:
             registrar.close()
             skipped += 1
+            status_label = "OpenAI 账号已删除或停用" if error.reason == "account_deactivated" else "已存在 GPT 账号"
             step(
                 index,
-                f"{error.email} 已存在 GPT 账号，已标记 GPT；自动更换邮箱（已跳过 {skipped} 个）",
+                f"{error.email} {status_label}，已标记 GPT；自动更换邮箱（已跳过 {skipped} 个）",
                 "yellow",
             )
             if skipped >= OPENAI_EXISTING_EMAIL_RETRY_LIMIT:
                 raise RuntimeError(
-                    f"连续 {skipped} 个邮箱已存在 GPT 账号，本任务停止；请检查邮箱池标签"
+                    f"连续 {skipped} 个邮箱不可用于 GPT 新注册，本任务停止；请检查邮箱池标签"
                 ) from error
         except Exception:
             registrar.close()

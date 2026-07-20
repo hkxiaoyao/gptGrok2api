@@ -17,6 +17,7 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | 协议兼容 | 提供 Chat Completions、Responses、Images、Anthropic Messages 兼容入口，支持流式与非流式响应、工具调用、搜索和推理强度。 |
 | GPT 运行时 | 支持 GPT 文本对话、网页搜索、图片生成、图片编辑、会话复用、文件下载以及 PPT/PSD 等可编辑文件任务。 |
 | Grok SSO 运行时 | 内置 Grok 账号池、额度刷新、账号调度、聊天、Responses、Messages、图片生成、图片编辑、视频生成和媒体缓存。 |
+| Grok 后台探测与恢复 | 服务启动后自动探测已加入运行池的非禁用账号；明确失效时使用已保存邮箱和密码重新登录、验证并替换 SSO，无需手动操作。 |
 | Grok Build OAuth | 支持 Device Code 授权、Access/Refresh Token 导入、自动刷新、模型探测以及独立 OAuth 凭据存储。 |
 | 账号生命周期 | 支持账号导入、分组、标签、额度同步、异常状态识别、限流恢复、无效账号清理、批量操作、代理绑定和运行状态监控。 |
 | iCloud Privacy Mail | 内置 sidecar；新接口负责 Apple 登录、2FA 和创建隐私邮箱，旧接口负责登录、2FA 和同步已有邮箱，IMAP App 专用密码负责取验证码。 |
@@ -26,8 +27,8 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | 本地 Captcha Solver | 源码内置于 `captcha-solver/`，使用 Docker/Xvfb 中的有头 CloakBrowser/Chromium 处理 Grok Turnstile，支持动态并发、代理透传和浏览器资源回收，不需要额外克隆第二个仓库。 |
 | Checkout 提链 | 注册 Checkout 仅保留 UPI 最终支付链接提取；IN Checkout、Provider、Approve 共享同一 sticky 出口，VN Promotion 使用独立代理持续轮换重试。 |
 | 代理与稳定出口 | 支持全局代理、账号代理、代理配置、代理组、节点并发限制、故障反馈、备用出口、WARP、Privoxy、FlareSolverr 和 Clearance 刷新。 |
-| 外部系统接入 | 支持从 Sub2API、远程 CPA、本地 CPA 和 Access Token 导入账号；Grok 注册成功后立即顺序完成 OAuth，并按配置并行投递 NovaApi 与 CPA；服务器部署提供 `gptgrok2api` Docker 网络别名。 |
-| 管理控制台 | 提供概览、GPT/Grok 账号管理、Grok Runtime、iCloud 邮箱、注册任务、Checkout 任务、代理管理、日志、实时监控、图片管理、调试中心和系统设置。 |
+| 外部系统接入 | 支持从 Sub2API、远程 CPA、本地 CPA 和 Access Token 导入账号；Grok 注册成功后立即进入 3-worker OAuth 优先级队列，并按配置投递 NovaApi 与 CPA；服务器部署提供 `gptgrok2api` Docker 网络别名。 |
+| 管理控制台 | 提供概览、GPT/Grok 账号与运行池管理、iCloud 邮箱、注册任务、Checkout 任务、代理管理、日志、实时监控、图片管理、调试中心和系统设置。 |
 | 存储与备份 | 账号数据支持 JSON、SQLite、PostgreSQL 和 Git 后端；图片支持本地与 WebDAV；备份支持本地归档和 R2。 |
 | 运维与发布 | 支持 Docker Compose、WARP 编排、内置 sidecar、Nginx HTTPS、运行日志、指标趋势、健康检查和 GitHub Releases 更新源。 |
 
@@ -48,6 +49,14 @@ docker compose -f docker-compose.warp.yml --profile local-icloud up -d
 注册区的邮箱 provider 有两种 iCloud 入口：`iCloud 邮箱（本系统）` 直接使用当前模块创建邮箱和取码，不需要填写 API Base、API Key 或域名；`iCloud API` 继续保留给独立部署的外部服务。已有 GPT 邮箱会显示绿色“GPT 已注册”标签，已有 Grok 邮箱会显示蓝色“Grok 已注册”标签；注册流程会按目标平台领取未标记邮箱，成功后写入对应标签，失败会释放该平台标签。
 
 定时创建按账号执行：新接口每个账号每小时最多 `20` 个，旧接口每个账号每小时最多 `5` 个；两种登录态都保存后每小时最多 `25` 个。每个账号累计达到 `750` 个后自动停止该账号，所有账号达到目标后定时器自动结束。控制台支持按选中账号启动定时创建，默认每 `60` 分钟执行一轮；邮箱卡片可直接查看或复制邮箱地址、单邮箱 API 及 `邮箱----API` 组合。
+
+## Grok 后台探测与自动恢复
+
+Grok 账号探测随服务启动自动在后台运行，无需在账号管理页手动启用或点击执行。默认每 `60` 分钟运行一轮，每批处理 `50` 个账号；首次启动且没有历史完成记录时会立即执行。
+
+调度器只探测已经加入内置 Grok 运行池、保存了 SSO 且未禁用的账号；探测复用 Fast 配额验证接口，不发送 Console 对话，也不会自动删除或禁用账号。只有运行时明确返回“失效”时才会读取该账号已保存的邮箱和密码重新登录；“未知”通常是超时或临时错误，只记录并等待下一轮。
+
+新 SSO 会先加入运行池并再次验证，确认有效后才删除旧 SSO并原子更新本地账号档案。恢复失败时保留旧档案，按 `1 / 2 / 4 / 8 / 16 / 24` 小时退避重试，最长间隔 `24` 小时。账号列表显示探测结果、恢复状态和恢复时间；恢复记录保存在 `data/grok_accounts.json`，调度完成记录保存在 `data/register.json`。
 
 ## 内置 Captcha Solver
 
@@ -83,14 +92,14 @@ macOS 需要“有头但不弹窗”时，推荐使用 `deploy/docker-compose.ca
 请求使用 Bearer 密钥：
 
 ```bash
-curl https://pro.muyuai.top/v1/models \
+curl http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer YOUR_AUTH_KEY"
 ```
 
 对话示例：
 
 ```bash
-curl https://pro.muyuai.top/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer YOUR_AUTH_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -99,6 +108,21 @@ curl https://pro.muyuai.top/v1/chat/completions \
       {"role": "user", "content": "你好"}
     ]
   }'
+```
+
+图片编辑示例：
+
+```bash
+curl http://127.0.0.1:8000/v1/images/edits \
+  -H "Authorization: Bearer YOUR_AUTH_KEY" \
+  -F "model=gpt-image-2" \
+  -F "image=@/path/to/input.png;type=image/png" \
+  -F "mask=@/path/to/mask.png;type=image/png" \
+  -F "prompt=只把人物头发改成鲜艳的红色，其他内容保持不变" \
+  -F "quality=standard" \
+  -F "n=1" \
+  -F "response_format=b64_json" \
+  -o image-edit-response.json
 ```
 
 ## 部署与排错文档
@@ -297,7 +321,7 @@ https://raw.githubusercontent.com/AuuCoder/gptGrok2api/main/CHANGELOG.md
 3. 更新日志从 GitHub 仓库 `main` 分支的 `CHANGELOG.md` 读取。
 4. 后端缓存 GitHub 查询结果，控制台比较版本号并显示更新状态。
 
-发布新版本时只需更新根目录 `VERSION` 和 `CHANGELOG.md`，推送版本标签并等待 GitHub Actions 完成，不再维护独立更新服务器。
+发布新版本时同步更新根目录 `VERSION`、Python/前端包版本和 `CHANGELOG.md`，推送版本标签并等待 GitHub Actions 完成，不再维护独立更新服务器。
 
 ## 本地开发
 

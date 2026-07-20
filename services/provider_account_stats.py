@@ -70,20 +70,37 @@ def _normalize(stats: object, provider: str, *, source_available: bool = True) -
 
 def _oauth_stats(items: object) -> dict[str, Any]:
     records = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-    statuses = {"active": 0, "disabled": 0, "expired": 0, "invalid": 0}
+    statuses = {"active": 0, "limited": 0, "disabled": 0, "abnormal": 0}
+    total_quota = 0
+    unknown_quota_count = 0
     for item in records:
         status = str(item.get("status") or "active").strip().lower()
-        statuses[status if status in statuses else "invalid"] += 1
+        probe = item.get("probe") if isinstance(item.get("probe"), dict) else {}
+        probe_status = str(probe.get("status") or "").strip().lower()
+        if status == "disabled":
+            statuses["disabled"] += 1
+            continue
+        if status in {"expired", "invalid"} or probe_status == "invalid":
+            statuses["abnormal"] += 1
+            continue
+        bucket = "limited" if probe_status == "limited" else "active"
+        statuses[bucket] += 1
+        quota = item.get("quota") if isinstance(item.get("quota"), dict) else {}
+        requests = quota.get("requests") if isinstance(quota.get("requests"), dict) else {}
+        if requests.get("remaining") is None:
+            unknown_quota_count += 1
+        else:
+            total_quota += _number(requests.get("remaining"))
     return {
         "total": len(records),
         "cumulative_total": len(records),
         "active": statuses["active"],
-        "limited": 0,
-        "abnormal": statuses["expired"] + statuses["invalid"],
+        "limited": statuses["limited"],
+        "abnormal": statuses["abnormal"],
         "disabled": statuses["disabled"],
-        "total_quota": 0,
+        "total_quota": total_quota,
         "unlimited_quota_count": 0,
-        "unknown_quota_count": 0,
+        "unknown_quota_count": unknown_quota_count,
         "total_success": sum(_number(item.get("use_count")) for item in records),
         "total_fail": sum(_number(item.get("fail_count")) for item in records),
         "by_type": {"oauth": len(records)} if records else {},

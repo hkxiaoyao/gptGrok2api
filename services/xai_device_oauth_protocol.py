@@ -317,7 +317,7 @@ class XaiDeviceOAuthProtocol:
             config["proxy"] = self.proxy
         return config
 
-    def authorize(self, *, email: str, password: str) -> dict[str, Any]:
+    def authorize(self, *, email: str, password: str, sso_only: bool = False) -> dict[str, Any]:
         clean_email = _clean_text(email)
         clean_password = _clean_text(password)
         if not clean_email or not clean_password:
@@ -418,6 +418,17 @@ class XaiDeviceOAuthProtocol:
             if session.status_code >= 400:
                 raise XaiDeviceOAuthProtocolError("xAI session cookie exchange failed", stage="session", retryable=True)
 
+            session_sso = client._cookie_value_for_domain("grok.com", "sso", "sso-rw")
+            if sso_only:
+                if not session_sso:
+                    raise XaiDeviceOAuthProtocolError(
+                        "xAI password login completed without a Grok SSO session",
+                        stage="session",
+                        retryable=True,
+                    )
+                self._emit("completed", "Grok SSO 登录态已恢复")
+                return {"sso": session_sso}
+
             self._emit("consent", "读取 Device Code 授权主体")
             reverify = client._request(
                 "POST",
@@ -477,6 +488,9 @@ class XaiDeviceOAuthProtocol:
                 )
                 token_payload = _safe_json(token)
                 if token.status_code == 200 and _clean_text(token_payload.get("access_token")):
+                    session_sso = session_sso or client._cookie_value_for_domain("grok.com", "sso", "sso-rw")
+                    if session_sso:
+                        token_payload["sso"] = session_sso
                     self._emit("completed", "Device Code OAuth 已授权")
                     return token_payload
                 error = _clean_text(token_payload.get("error"))

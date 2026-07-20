@@ -261,20 +261,10 @@
             >
               OAuth 接入 ({{ grokOAuthTotal }})
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              :root-class="accountToolbarSecondaryClass"
-              :disabled="grokBatchChatTestProgress.busy || Boolean(grokConversationAccount) || Boolean(grokChattingAccountId) || grokAccountAllTotal === 0"
-              title="逐个测试全部保存 SSO 的 Grok 账号，会消耗一次 Console 对话额度"
-              @click="runGrokBatchChatTest"
-            >
-              {{ grokBatchChatTestProgress.busy ? '全部测试中...' : '全部对话测试' }}
-            </Button>
             <FloatingActionMenu
               label="导出"
               :items="grokExportMenuItems"
-              :disabled="grokBatchChatTestProgress.busy || grokExportBusy || grokAccountAllTotal === 0"
+              :disabled="grokExportBusy || grokAccountAllTotal === 0"
               align="left"
               :trigger-class="accountToolbarMenuClass"
               @select="handleGrokExportAction"
@@ -286,7 +276,7 @@
               size="sm"
               variant="outline"
               :root-class="accountToolbarSecondaryClass"
-              :disabled="grokLoading || grokBatchChatTestProgress.busy"
+              :disabled="grokLoading"
               @click="loadGrokAccounts"
             >
               刷新列表
@@ -302,8 +292,8 @@
       />
 
       <TableShell v-else-if="grokViewMode === 'list'">
-        <table class="min-w-[1260px] w-full text-left text-sm">
-          <thead class="text-xs uppercase tracking-[0.16em] text-muted-foreground">
+        <table class="min-w-[1700px] w-full table-fixed text-left text-sm">
+          <thead class="text-xs font-medium text-muted-foreground">
             <tr>
               <th class="w-12 py-3 pr-4">
                 <Checkbox
@@ -311,19 +301,22 @@
                   @update:model-value="toggleSelectAllVisibleGrokAccounts"
                 />
               </th>
-              <th class="py-3 pr-5">账号 / TOKEN</th>
-              <th class="py-3 pr-5">类型 / OAuth</th>
-              <th class="py-3 pr-5">注册状态</th>
-              <th class="py-3 pr-5">运行状态</th>
-              <th class="py-3 pr-5">额度 A / F / E / H / C</th>
-              <th class="py-3 pr-5">成功 / 失败 / 成功率</th>
-              <th class="py-3 pr-5">最近使用</th>
-              <th class="py-3 text-right">操作</th>
+              <th class="w-[12rem] py-3 pr-5">账号 / TOKEN</th>
+              <th class="w-[5.5rem] py-3 pr-5">账号类型</th>
+              <th class="w-[5.5rem] py-3 pr-5">注册状态</th>
+              <th class="w-[8rem] py-3 pr-5">SSO 状态</th>
+              <th class="w-[11rem] py-3 pr-5">SSO 额度 A / F / E / H / C</th>
+              <th class="w-[8.5rem] py-3 pr-5">OAuth 状态</th>
+              <th class="w-[13rem] py-3 pr-5">OAuth 额度</th>
+              <th class="w-[7rem] py-3 pr-5">恢复时间</th>
+              <th class="w-[9rem] py-3 pr-5">成功 / 失败</th>
+              <th class="w-[8rem] py-3 pr-5">最近使用</th>
+              <th class="w-[16rem] py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody class="text-sm text-foreground">
             <tr v-if="!grokLoading && grokAccounts.length === 0">
-              <td colspan="9" class="py-6">
+              <td colspan="12" class="py-6">
                 <EmptyState
                   plain
                   title="暂无 Grok 账号"
@@ -337,7 +330,7 @@
               :item="item"
               :selected="isGrokAccountSelected(item.id)"
               :runtime-available="grokRuntimeAvailable"
-              :busy="grokBatchBusy || grokBatchChatTestProgress.busy"
+              :busy="grokBatchBusy"
               :syncing="grokSyncingAccountId === item.id"
               :refreshing="grokRefreshingAccountId === item.id"
               :testing="grokTestingAccountId === item.id"
@@ -377,7 +370,7 @@
           :item="item"
           :selected="isGrokAccountSelected(item.id)"
           :runtime-available="grokRuntimeAvailable"
-          :busy="grokBatchBusy || grokBatchChatTestProgress.busy"
+          :busy="grokBatchBusy"
           :syncing="grokSyncingAccountId === item.id"
           :refreshing="grokRefreshingAccountId === item.id"
           :testing="grokTestingAccountId === item.id"
@@ -406,7 +399,7 @@
         :total-count="grokAccountListTotal"
         :page-size-options="grokPageSizeOptions"
         unit="个 Grok 账号"
-        :disabled="grokLoading || grokBatchChatTestProgress.busy"
+        :disabled="grokLoading"
       />
     </PagePanel>
 
@@ -423,7 +416,7 @@
     <AccountBulkBar
       v-if="activeAccountPlatform === 'grok'"
       :selected-count="grokSelectedCount"
-      :busy="grokBatchBusy || grokBatchChatTestProgress.busy"
+      :busy="grokBatchBusy"
       :busy-label="grokBatchActionLabel"
       :items="grokBatchMenuItems"
       @select="runGrokBulkAction"
@@ -449,39 +442,6 @@
       @close="showGrokOAuthAccess = false"
       @changed="handleGrokOAuthChanged"
     />
-
-    <OperationProgressModal
-      :open="grokBatchChatTestProgress.open"
-      :title="grokBatchChatTestProgress.title"
-      :subtitle="grokBatchChatTestProgress.subtitle"
-      :total="grokBatchChatTestProgress.total"
-      :current="grokBatchChatTestProgress.current"
-      :status-label="grokBatchChatTestProgress.statusLabel"
-      :message="grokBatchChatTestProgress.message"
-      :error="grokBatchChatTestProgress.error"
-      :busy="grokBatchChatTestProgress.busy"
-      :can-cancel="grokBatchChatTestCanCancel"
-      max-width="42rem"
-      @close="grokBatchChatTestProgress.open = false"
-      @cancel="cancelGrokBatchChatTest"
-    >
-      <template v-if="grokBatchChatTestFailureDetails.length" #details>
-        <div class="space-y-2">
-          <p class="ui-field-label">非成功账号（封禁与登录失效优先，最多 20 项）</p>
-          <ul class="max-h-56 divide-y divide-border overflow-auto">
-            <li v-for="item in grokBatchChatTestFailureDetails" :key="item.id" class="py-2 first:pt-0">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <span class="break-all font-mono text-xs text-foreground">{{ item.id }}</span>
-                <span class="text-xs font-medium" :class="grokBatchChatTestResultStatusClass(item.status)">{{ grokBatchChatTestResultStatusText(item.status) }}</span>
-              </div>
-              <p class="mt-1 break-words text-xs leading-5 text-muted-foreground">
-                {{ item.error || '未返回错误说明' }}
-              </p>
-            </li>
-          </ul>
-        </div>
-      </template>
-    </OperationProgressModal>
 
     <ModalShell :open="activeAccountPlatform === 'gpt' && showModal" max-width="44rem" :z-index="120">
             <ModalHeader :title="editingId ? '编辑账号' : '添加账号'" :bordered="false" compact @close="closeModal" />
@@ -967,7 +927,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { Button, Checkbox, EmptyState, Input } from 'nanocat-ui'
 import AccountBulkBar from '@/components/ai/AccountBulkBar.vue'
 import AccountSelectionSummary from '@/components/ai/AccountSelectionSummary.vue'
@@ -996,9 +957,6 @@ import type { GrokOAuthAccount } from '@/api/grokOAuthAccounts'
 import {
   grokAccountsApi,
   type GrokAccount,
-  type GrokAccountsBatchChatTestJob,
-  type GrokAccountsBatchChatTestResult,
-  type GrokAccountsBatchChatTestSummary,
   type GrokQuotaMode,
 } from '@/api/grokAccounts'
 import AccountGridCard from './accounts/AccountGridCard.vue'
@@ -1026,10 +984,6 @@ import {
 defineOptions({ name: 'Accounts' })
 
 const RemoteAccountImportPanel = defineAsyncComponent(() => import('@/components/ai/RemoteAccountImportPanel.vue'))
-const OperationProgressModal = defineAsyncComponent(() => import('@/components/ai/OperationProgressModal.vue'))
-const GROK_BATCH_CHAT_TEST_MODEL = 'grok-4.3-console'
-const GROK_BATCH_CHAT_TEST_PROMPT = '你好，请只回复 OK。'
-const GROK_BATCH_CHAT_TEST_POLL_INTERVAL_MS = 1200
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
 
@@ -1196,7 +1150,14 @@ const {
 
 type AccountPlatformView = 'gpt' | 'grok'
 
-const activeAccountPlatform = ref<AccountPlatformView>('gpt')
+const route = useRoute()
+const router = useRouter()
+
+function accountPlatformFromQuery(value: unknown): AccountPlatformView {
+  return String(value || '').trim().toLowerCase() === 'grok' ? 'grok' : 'gpt'
+}
+
+const activeAccountPlatform = ref<AccountPlatformView>(accountPlatformFromQuery(route.query.platform))
 const grokCredentialsAccount = ref<GrokAccount | null>(null)
 const grokConversationAccount = ref<GrokAccount | null>(null)
 const grokChattingAccountId = ref('')
@@ -1213,25 +1174,6 @@ const grokOAuthRowAction = reactive<{ accountId: string; action: GrokOAuthRowAct
   accountId: '',
   action: '',
 })
-const grokBatchChatTestProgress = reactive({
-  open: false,
-  title: '全部 Grok 对话测试',
-  subtitle: `固定模型：${GROK_BATCH_CHAT_TEST_MODEL}`,
-  total: 0,
-  current: 0,
-  statusLabel: '已提交',
-  message: '',
-  error: '',
-  busy: false,
-  jobId: '',
-  jobStatus: '',
-  currentId: '',
-  cancelRequested: false,
-  results: [] as GrokAccountsBatchChatTestResult[],
-})
-let grokBatchChatTestPollTimer: number | null = null
-let grokBatchChatTestPollVersion = 0
-let grokBatchChatTestFinalizedJobId = ''
 const accountPlatformOptions = computed(() => [
   { value: 'gpt', label: `GPT (${accountAllTotal.value})` },
   { value: 'grok', label: `Grok (${grokAccountAllTotal.value})` },
@@ -1289,15 +1231,28 @@ const grokMetricItems = computed(() => {
 
   const runtimeTotal = safeMetricNumber(summary.runtime_total)
   const oauthTotal = safeMetricNumber(summary.oauth_total)
-  if (oauthTotal > 0) {
-    items.push({
-      key: 'oauth-total',
-      label: 'OAuth',
-      value: oauthTotal,
-      meta: `已关联 ${safeMetricNumber(summary.oauth_linked)} 个注册账号`,
-      valueClass: 'text-emerald-600',
-    })
+  const oauthLinked = safeMetricNumber(summary.oauth_linked)
+  items.push({
+    key: 'oauth-total',
+    label: 'OAuth 已授权',
+    value: oauthLinked,
+    meta: `OAuth 凭据 ${oauthTotal}`,
+    valueClass: 'text-emerald-600',
+  })
+
+  const oauthStatus = summary.oauth_status || {}
+  const oauthMetrics = [
+    { key: 'oauth-normal', label: 'OAuth 正常', value: optionalMetricNumber(oauthStatus.normal), valueClass: 'text-emerald-600' },
+    { key: 'oauth-limited', label: 'OAuth 限流', value: optionalMetricNumber(oauthStatus.limited), valueClass: 'text-amber-600' },
+    { key: 'oauth-expired', label: 'OAuth 过期', value: optionalMetricNumber(oauthStatus.expired), valueClass: 'text-rose-600' },
+    { key: 'oauth-invalid', label: 'OAuth 失效', value: optionalMetricNumber(oauthStatus.invalid), valueClass: 'text-rose-600' },
+    { key: 'oauth-unauthorized', label: 'OAuth 未授权', value: optionalMetricNumber(oauthStatus.unauthorized), valueClass: 'text-muted-foreground' },
+  ]
+  for (const metric of oauthMetrics) {
+    if (metric.value === null) continue
+    items.push({ ...metric, value: metric.value })
   }
+
   if (!grokRuntimeAvailable.value || runtimeTotal <= 0) {
     items.push({
       key: 'runtime-connection',
@@ -1309,12 +1264,7 @@ const grokMetricItems = computed(() => {
     return items
   }
 
-  const runtimeStatus = summary.runtime_status || {}
   const runtimeMetrics = [
-    { key: 'runtime-active', label: '正常', value: optionalMetricNumber(runtimeStatus.active), valueClass: 'text-emerald-600' },
-    { key: 'runtime-cooling', label: '限流', value: optionalMetricNumber(runtimeStatus.cooling), valueClass: 'text-amber-600' },
-    { key: 'runtime-invalid', label: '异常', value: optionalMetricNumber(runtimeStatus.invalid), valueClass: 'text-rose-600' },
-    { key: 'runtime-disabled', label: '禁用', value: optionalMetricNumber(runtimeStatus.disabled), valueClass: 'text-muted-foreground' },
     { key: 'calls-total', label: '调用总数', value: optionalMetricNumber(summary.calls_total), valueClass: '' },
   ]
   for (const metric of runtimeMetrics) {
@@ -1333,8 +1283,7 @@ const grokMetricItems = computed(() => {
 
 const grokOAuthTotal = computed(() => safeMetricNumber(grokSummary.value?.oauth_total))
 
-function setActiveAccountPlatform(value: string) {
-  if (value !== 'gpt' && value !== 'grok') return
+function applyActiveAccountPlatform(value: AccountPlatformView) {
   activeAccountPlatform.value = value
   if (value !== 'grok') grokCredentialsAccount.value = null
   if (value !== 'grok') showGrokOAuthAccess.value = false
@@ -1343,6 +1292,26 @@ function setActiveAccountPlatform(value: string) {
     void loadGrokAccounts({ silentErrorToast: true })
   }
 }
+
+function setActiveAccountPlatform(value: string) {
+  if (value !== 'gpt' && value !== 'grok') return
+  applyActiveAccountPlatform(value)
+
+  const current = accountPlatformFromQuery(route.query.platform)
+  if (current === value) return
+  const query = { ...route.query }
+  if (value === 'grok') query.platform = 'grok'
+  else delete query.platform
+  void router.replace({ name: 'accounts', query })
+}
+
+watch(
+  () => route.query.platform,
+  (value) => {
+    const platform = accountPlatformFromQuery(value)
+    if (platform !== activeAccountPlatform.value) applyActiveAccountPlatform(platform)
+  },
+)
 
 async function handleGrokExportAction(format: string) {
   if (format === 'json' || format === 'txt') {
@@ -1361,255 +1330,6 @@ async function refreshGrokAccount(item: GrokAccount) {
 async function testGrokAccount(item: GrokAccount) {
   await testGrokAccountValidity(item)
 }
-
-function normalizeGrokBatchChatTestSummary(summary: Partial<GrokAccountsBatchChatTestSummary> | null | undefined) {
-  return {
-    total: safeMetricNumber(summary?.total),
-    success: safeMetricNumber(summary?.success),
-    blocked: safeMetricNumber(summary?.blocked),
-    invalid: safeMetricNumber(summary?.invalid),
-    limited: safeMetricNumber(summary?.limited),
-    permission: safeMetricNumber(summary?.permission),
-    failed: safeMetricNumber(summary?.failed),
-    skipped: safeMetricNumber(summary?.skipped),
-  }
-}
-
-function grokBatchChatTestSummaryText(summary: ReturnType<typeof normalizeGrokBatchChatTestSummary>) {
-  return `成功 ${summary.success}，封禁 ${summary.blocked}，登录失效 ${summary.invalid}，限流 ${summary.limited}，权限 ${summary.permission}，失败 ${summary.failed}，跳过 ${summary.skipped}`
-}
-
-function grokBatchChatTestJobStatusText(status: string) {
-  return ({
-    queued: '排队中',
-    running: '正在执行',
-    completed: '已完成',
-    cancelled: '已停止',
-    failed: '失败',
-  } as Record<string, string>)[status] || status || '正在执行'
-}
-
-function grokBatchChatTestResultStatusText(status: string) {
-  return ({
-    blocked: '已封禁',
-    invalid: '登录失效',
-    limited: '限流（非封禁）',
-    permission: 'Console 无权限',
-    failed: '测试失败 / 无法判断',
-    skipped: '跳过',
-  } as Record<string, string>)[status] || status || '未知'
-}
-
-function grokBatchChatTestResultStatusClass(status: string) {
-  return ({
-    blocked: 'text-rose-600',
-    invalid: 'text-rose-600',
-    limited: 'text-amber-600',
-    permission: 'text-sky-600',
-    failed: 'text-rose-600',
-    skipped: 'text-muted-foreground',
-  } as Record<string, string>)[status] || 'text-muted-foreground'
-}
-
-function isGrokBatchChatTestTerminal(status: string) {
-  return status === 'completed' || status === 'cancelled' || status === 'failed'
-}
-
-const grokBatchChatTestCanCancel = computed(() => (
-  grokBatchChatTestProgress.busy
-  && Boolean(grokBatchChatTestProgress.jobId)
-  && !grokBatchChatTestProgress.cancelRequested
-  && ['queued', 'running'].includes(grokBatchChatTestProgress.jobStatus)
-))
-
-const grokBatchChatTestFailureDetails = computed(() => (
-  grokBatchChatTestProgress.results
-    .filter((item) => !['success', 'pending'].includes(String(item.status || '').toLowerCase()))
-    .sort((left, right) => {
-      const priority: Record<string, number> = { blocked: 0, invalid: 1, permission: 2, failed: 3, limited: 4, skipped: 5 }
-      return (priority[String(left.status || '').toLowerCase()] ?? 9) - (priority[String(right.status || '').toLowerCase()] ?? 9)
-    })
-    .slice(0, 20)
-))
-
-function stopGrokBatchChatTestPolling() {
-  grokBatchChatTestPollVersion += 1
-  if (grokBatchChatTestPollTimer !== null) {
-    window.clearTimeout(grokBatchChatTestPollTimer)
-    grokBatchChatTestPollTimer = null
-  }
-}
-
-function applyGrokBatchChatTestJob(job: GrokAccountsBatchChatTestJob) {
-  const status = String(job.status || '').toLowerCase()
-  const summary = normalizeGrokBatchChatTestSummary(job.summary)
-  const total = Math.max(safeMetricNumber(job.total), summary.total)
-  const current = Math.min(total, safeMetricNumber(job.current))
-  const results = Array.isArray(job.results) ? job.results : []
-  const summaryText = grokBatchChatTestSummaryText(summary)
-
-  grokBatchChatTestProgress.jobId = String(job.id || '').trim()
-  grokBatchChatTestProgress.jobStatus = status
-  grokBatchChatTestProgress.currentId = String(job.current_id || '').trim()
-  grokBatchChatTestProgress.total = total
-  grokBatchChatTestProgress.current = current
-  grokBatchChatTestProgress.statusLabel = grokBatchChatTestJobStatusText(status)
-  grokBatchChatTestProgress.results = results
-  grokBatchChatTestProgress.cancelRequested = Boolean(job.cancel_requested)
-  grokBatchChatTestProgress.message = isGrokBatchChatTestTerminal(status)
-    ? summaryText
-    : `${grokBatchChatTestJobStatusText(status)}：${current} / ${total}${grokBatchChatTestProgress.currentId ? `；当前 ${grokBatchChatTestProgress.currentId}` : ''}；${summaryText}`
-  grokBatchChatTestProgress.error = status === 'failed'
-    ? String(job.error || '全部对话测试任务失败')
-    : ''
-}
-
-async function finalizeGrokBatchChatTest(job: GrokAccountsBatchChatTestJob) {
-  const jobId = String(job.id || '').trim()
-  if (!jobId || grokBatchChatTestFinalizedJobId === jobId) return
-  grokBatchChatTestFinalizedJobId = jobId
-  stopGrokBatchChatTestPolling()
-  applyGrokBatchChatTestJob(job)
-  grokBatchChatTestProgress.busy = false
-  grokBatchChatTestProgress.cancelRequested = false
-
-  const summary = normalizeGrokBatchChatTestSummary(job.summary)
-  const summaryText = grokBatchChatTestSummaryText(summary)
-  const status = String(job.status || '').toLowerCase()
-  if (status === 'completed') {
-    if (summary.limited || summary.permission || summary.failed) {
-      toast.warning(`全部对话测试完成：${summaryText}`)
-    } else {
-      toast.success(`全部对话测试完成：${summaryText}`)
-    }
-  } else if (status === 'cancelled') {
-    toast.info(`全部对话测试已停止：${summaryText}`)
-  } else {
-    toast.error(grokBatchChatTestProgress.error || '全部对话测试任务失败')
-  }
-
-  await loadGrokAccounts({ silentErrorToast: true })
-}
-
-function scheduleGrokBatchChatTestPoll(jobId: string, version: number) {
-  if (version !== grokBatchChatTestPollVersion || !grokBatchChatTestProgress.busy) return
-  if (grokBatchChatTestPollTimer !== null) window.clearTimeout(grokBatchChatTestPollTimer)
-  grokBatchChatTestPollTimer = window.setTimeout(() => {
-    grokBatchChatTestPollTimer = null
-    void pollGrokBatchChatTest(jobId, version)
-  }, GROK_BATCH_CHAT_TEST_POLL_INTERVAL_MS)
-}
-
-async function pollGrokBatchChatTest(jobId: string, version: number) {
-  if (version !== grokBatchChatTestPollVersion || !grokBatchChatTestProgress.busy) return
-  try {
-    const result = await grokAccountsApi.getBatchChatTestJob(jobId)
-    if (version !== grokBatchChatTestPollVersion) return
-    const job = result.job
-    applyGrokBatchChatTestJob(job)
-    if (isGrokBatchChatTestTerminal(String(job.status || '').toLowerCase())) {
-      await finalizeGrokBatchChatTest(job)
-      return
-    }
-  } catch (error) {
-    if (version !== grokBatchChatTestPollVersion) return
-    const message = errorMessage(error, '读取全部对话测试进度失败')
-    const status = Number((error as { status?: unknown })?.status || 0)
-    if ([401, 403, 404].includes(status)) {
-      stopGrokBatchChatTestPolling()
-      grokBatchChatTestProgress.busy = false
-      grokBatchChatTestProgress.cancelRequested = false
-      grokBatchChatTestProgress.statusLabel = '失败'
-      grokBatchChatTestProgress.error = message
-      toast.error(message, '全部对话测试失败')
-      await loadGrokAccounts({ silentErrorToast: true })
-      return
-    }
-    grokBatchChatTestProgress.message = `${message}，正在重试...`
-  }
-  scheduleGrokBatchChatTestPoll(jobId, version)
-}
-
-async function cancelGrokBatchChatTest() {
-  const jobId = grokBatchChatTestProgress.jobId
-  if (!jobId || !grokBatchChatTestCanCancel.value) return
-  grokBatchChatTestProgress.cancelRequested = true
-  grokBatchChatTestProgress.message = '正在请求停止全部对话测试...'
-  try {
-    const result = await grokAccountsApi.cancelBatchChatTestJob(jobId)
-    const job = result.job
-    applyGrokBatchChatTestJob(job)
-    if (isGrokBatchChatTestTerminal(String(job.status || '').toLowerCase())) {
-      await finalizeGrokBatchChatTest(job)
-    }
-  } catch (error) {
-    grokBatchChatTestProgress.cancelRequested = false
-    grokBatchChatTestProgress.error = errorMessage(error, '停止全部对话测试失败')
-    toast.error(grokBatchChatTestProgress.error)
-  }
-}
-
-async function runGrokBatchChatTest() {
-  if (
-    grokBatchChatTestProgress.busy
-    || grokConversationAccount.value
-    || grokChattingAccountId.value
-  ) return
-  if (!grokAccountAllTotal.value) {
-    toast.warning('暂无可测试的 Grok 账号')
-    return
-  }
-  const confirmed = await confirmDialog.ask({
-    title: '确认全部对话测试',
-    message: `将逐个对全部保存 SSO 登录态的 Grok 账号发起一次 Console 对话测试，固定使用 ${GROK_BATCH_CHAT_TEST_MODEL}。每个可测账号都会消耗一次 Console 对话额度；没有 SSO 登录态的账号会跳过。是否继续？`,
-    confirmText: '开始测试',
-    cancelText: '取消',
-  })
-  if (!confirmed) return
-
-  Object.assign(grokBatchChatTestProgress, {
-    open: true,
-    title: '全部 Grok 对话测试',
-    subtitle: `固定模型：${GROK_BATCH_CHAT_TEST_MODEL}`,
-    total: 0,
-    current: 0,
-    statusLabel: '正在创建任务',
-    message: '正在创建后台测试任务...',
-    error: '',
-    busy: true,
-    jobId: '',
-    jobStatus: 'queued',
-    currentId: '',
-    cancelRequested: false,
-    results: [],
-  })
-  grokBatchChatTestFinalizedJobId = ''
-  stopGrokBatchChatTestPolling()
-  const version = grokBatchChatTestPollVersion
-
-  try {
-    const result = await grokAccountsApi.startBatchChatTest({
-      prompt: GROK_BATCH_CHAT_TEST_PROMPT,
-      model: GROK_BATCH_CHAT_TEST_MODEL,
-    })
-    const job = result.job
-    if (!job || !String(job.id || '').trim()) throw new Error('后台测试任务未返回任务 ID')
-    applyGrokBatchChatTestJob(job)
-    if (isGrokBatchChatTestTerminal(String(job.status || '').toLowerCase())) {
-      await finalizeGrokBatchChatTest(job)
-      return
-    }
-    scheduleGrokBatchChatTestPoll(String(job.id), version)
-  } catch (error) {
-    const message = errorMessage(error, '全部对话测试失败')
-    grokBatchChatTestProgress.statusLabel = '失败'
-    grokBatchChatTestProgress.error = message
-    grokBatchChatTestProgress.busy = false
-    toast.error(message, '全部对话测试失败')
-  }
-}
-
-onBeforeUnmount(stopGrokBatchChatTestPolling)
 
 function openGrokConversationTest(item: GrokAccount) {
   if (!item.has_sso || grokChattingAccountId.value) return

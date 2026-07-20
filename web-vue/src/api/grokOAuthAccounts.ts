@@ -1,6 +1,45 @@
 import apiClient from '@/api/client'
 
 export type GrokOAuthAccountStatus = 'active' | 'disabled' | 'expired' | 'invalid'
+export type GrokOAuthProbeStatus = 'valid' | 'limited' | 'invalid' | 'unknown'
+
+export type GrokOAuthQuotaWindow = {
+  limit?: number
+  remaining?: number
+  reset?: string
+}
+
+export type GrokOAuthQuota = {
+  requests?: GrokOAuthQuotaWindow
+  tokens?: GrokOAuthQuotaWindow
+  updated_at?: string
+}
+
+export type GrokOAuthProbe = {
+  status: GrokOAuthProbeStatus | (string & {})
+  at: string
+  model: string
+  http_status: number
+  code: string
+  error: string
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    total_tokens?: number
+    cost_in_usd_ticks?: number
+  }
+}
+
+export type GrokOAuthRecovery = {
+  status: 'pending' | 'running' | 'success' | 'failed' | (string & {})
+  job_id: string
+  source_account_id: string
+  last_attempt_at: string
+  last_success_at: string
+  next_attempt_at: string
+  attempts: number
+  error: string
+}
 
 export type GrokOAuthAccount = {
   id: string
@@ -21,6 +60,9 @@ export type GrokOAuthAccount = {
     [key: string]: unknown
   }
   models: string[]
+  probe?: GrokOAuthProbe
+  quota?: GrokOAuthQuota
+  recovery?: GrokOAuthRecovery
   use_count: number
   fail_count: number
   last_used_at: string
