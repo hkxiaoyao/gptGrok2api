@@ -18,17 +18,16 @@ export type RegisterOutlookPoolRuntimeInput = {
 }
 
 export const outlookPoolActionItems = [
-  { key: 'retry_failed', label: '重试临时失败' },
-  { key: 'retryable', label: '释放占用/失败' },
+  { key: 'retryable', label: '释放全部占用/失败' },
   { key: 'invalid', label: '清除异常标记', dividerBefore: true },
-  { key: 'unused', label: '清空已用邮箱', danger: true, dividerBefore: true },
+  { key: 'unused', label: '删除未使用邮箱', danger: true, dividerBefore: true },
   { key: 'all', label: '重置全部邮箱池', danger: true },
 ]
 
 const resetCopy: Record<OutlookResetScope, ConfirmOptions> = {
   retryable: {
-    title: '释放占用/临时失败',
-    message: '将释放 in_use 和 failed 邮箱，后续注册任务可以重新使用这些材料。',
+    title: '释放全部占用/临时失败',
+    message: '将释放邮箱池中全部 in_use 和 failed 邮箱，但不会自动启动注册任务。',
     confirmText: '释放',
   },
   invalid: {
@@ -37,9 +36,9 @@ const resetCopy: Record<OutlookResetScope, ConfirmOptions> = {
     confirmText: '清除',
   },
   unused: {
-    title: '清空已用邮箱',
-    message: '将清空 Outlook 邮箱池中的已用记录，可能导致后续重复尝试同一邮箱。',
-    confirmText: '清空',
+    title: '删除未使用邮箱',
+    message: '将从 Outlook 邮箱池配置中永久删除尚未使用、未占用且没有失败或异常记录的邮箱材料。',
+    confirmText: '删除',
   },
   all: {
     title: '重置全部邮箱池',
@@ -64,20 +63,23 @@ export function useRegisterOutlookPoolRuntime(input: RegisterOutlookPoolRuntimeI
     }
   }
 
-  async function retryFailedPool() {
+  async function retryFailedPool(providerId: string, mailboxIds: string[]) {
+    const selected = Array.from(new Set(mailboxIds.filter(Boolean)))
+    if (!providerId || selected.length === 0) {
+      input.notifyError('请至少选择 1 个本次失败邮箱')
+      return
+    }
     const ok = await input.confirm({
-      title: '重试临时失败邮箱',
-      message: '将释放 in_use 和 failed 邮箱，并立即启动注册任务继续重试。',
+      title: `重试所选 ${selected.length} 个邮箱`,
+      message: `只会释放并重试所选 ${selected.length} 个本次失败邮箱，其他邮箱保持原状态。`,
       confirmText: '重试',
     })
     if (!ok) return
     input.saving.value = true
     try {
-      const resetResponse = await registerApi.resetOutlookPool('retryable')
-      input.applyConfig(resetResponse.register)
-      const startResponse = await registerApi.startLegacy()
-      input.applyConfig(startResponse.register)
-      input.notifySuccess('已释放临时失败邮箱并启动注册任务')
+      const response = await registerApi.retrySelectedOutlookMailboxes(providerId, selected)
+      input.applyConfig(response.register)
+      input.notifySuccess(`已启动 ${selected.length} 个所选邮箱的重试任务`)
     } catch (error: any) {
       input.notifyError(error?.message || '重试临时失败邮箱失败')
     } finally {
@@ -86,10 +88,6 @@ export function useRegisterOutlookPoolRuntime(input: RegisterOutlookPoolRuntimeI
   }
 
   function handleAction(key: string) {
-    if (key === 'retry_failed') {
-      void retryFailedPool()
-      return
-    }
     if (key === 'retryable' || key === 'invalid' || key === 'unused' || key === 'all') {
       void resetPool(key)
     }

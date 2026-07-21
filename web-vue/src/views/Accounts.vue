@@ -210,7 +210,7 @@
         density="compact"
       />
       <SurfaceBox
-        v-if="!grokRuntimeAvailable && grokRuntimeError"
+        v-if="grokRuntimeError"
         tone="muted"
         density="compact"
         wrap
@@ -337,6 +337,7 @@
               :chatting="grokChattingAccountId === item.id"
               :toggling="grokTogglingAccountId === item.id"
               :deleting="grokRemovingAccountId === item.id"
+              :authorizing="grokAuthorizingAccountId === item.id"
               :oauth-action="grokOAuthActionFor(item)"
               @toggle-select="toggleGrokAccountSelection"
               @credentials="openGrokLoginCredentials"
@@ -347,6 +348,7 @@
               @toggle-disabled="toggleGrokAccountDisabled"
               @remove="removeGrokAccount"
               @oauth-sync="syncGrokOAuthAccount"
+              @oauth-authorize="authorizeGrokOAuthAccount"
               @oauth-refresh="refreshGrokOAuthAccount"
               @oauth-toggle="toggleGrokOAuthAccount"
               @oauth-remove="removeGrokOAuthAccount"
@@ -377,6 +379,7 @@
           :chatting="grokChattingAccountId === item.id"
           :toggling="grokTogglingAccountId === item.id"
           :deleting="grokRemovingAccountId === item.id"
+          :authorizing="grokAuthorizingAccountId === item.id"
           :oauth-action="grokOAuthActionFor(item)"
           @toggle-select="toggleGrokAccountSelection"
           @credentials="openGrokLoginCredentials"
@@ -387,6 +390,7 @@
           @toggle-disabled="toggleGrokAccountDisabled"
           @remove="removeGrokAccount"
           @oauth-sync="syncGrokOAuthAccount"
+          @oauth-authorize="authorizeGrokOAuthAccount"
           @oauth-refresh="refreshGrokOAuthAccount"
           @oauth-toggle="toggleGrokOAuthAccount"
           @oauth-remove="removeGrokOAuthAccount"
@@ -1131,6 +1135,8 @@ const {
   clearSelection: clearGrokSelection,
   batchBusy: grokBatchBusy,
   batchActionLabel: grokBatchActionLabel,
+  authorizingAccountId: grokAuthorizingAccountId,
+  authorizeOAuth: authorizeGrokOAuth,
   syncingAccountId: grokSyncingAccountId,
   syncAccounts: syncGrokAccounts,
   refreshingAccountId: grokRefreshingAccountId,
@@ -1179,12 +1185,30 @@ const accountPlatformOptions = computed(() => [
   { value: 'grok', label: `Grok (${grokAccountAllTotal.value})` },
 ])
 
-const grokExportMenuItems = [
-  { key: 'json', label: '导出 JSON' },
-  { key: 'txt', label: '导出 TXT' },
-]
+const grokExportMenuItems = computed(() => [
+  {
+    key: 'selected',
+    label: `导出选中${grokSelectedCount.value ? ` (${grokSelectedCount.value})` : ''}`,
+    disabled: grokSelectedCount.value === 0,
+    children: [
+      { key: 'selected_sub2api', label: 'Sub2API 格式 (.json)' },
+      { key: 'selected_cpa', label: 'CPA 格式 (.zip)' },
+    ],
+  },
+  {
+    key: 'all',
+    label: '导出全部',
+    disabled: grokAccountAllTotal.value === 0,
+    dividerBefore: true,
+    children: [
+      { key: 'all_sub2api', label: 'Sub2API 格式 (.json)' },
+      { key: 'all_cpa', label: 'CPA 格式 (.zip)' },
+    ],
+  },
+])
 
 const grokBatchMenuItems = computed(() => [
+  { key: 'authorize', label: 'OAuth 授权' },
   { key: 'sync', label: '加入运行池', disabled: !grokRuntimeAvailable.value },
   { key: 'refresh', label: '刷新状态和额度', disabled: !grokRuntimeAvailable.value },
   { key: 'disable', label: '禁用选中', disabled: !grokRuntimeAvailable.value },
@@ -1313,10 +1337,13 @@ watch(
   },
 )
 
-async function handleGrokExportAction(format: string) {
-  if (format === 'json' || format === 'txt') {
-    await exportGrokAccounts(format)
-  }
+async function handleGrokExportAction(action: string) {
+  const match = action.match(/^(selected|all)_(sub2api|cpa)$/)
+  if (!match) return
+  await exportGrokAccounts(
+    match[1] as 'selected' | 'all',
+    match[2] as 'sub2api' | 'cpa',
+  )
 }
 
 async function syncGrokAccount(item: GrokAccount) {
@@ -1359,6 +1386,10 @@ function setGrokConversationRunning(accountId: string, running: boolean) {
 async function toggleGrokAccountDisabled(item: GrokAccount) {
   const disabled = String(item.runtime_status || '').toLowerCase() !== 'disabled'
   await setGrokRuntimeDisabled([item.id], disabled)
+}
+
+function authorizeGrokOAuthAccount(item: GrokAccount) {
+  return authorizeGrokOAuth([item.id])
 }
 
 function grokOAuthActionFor(item: GrokAccount) {

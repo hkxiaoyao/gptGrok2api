@@ -1,4 +1,4 @@
-import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { statsApi } from '@/api/stats'
 import { usePageQuery } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
@@ -196,6 +196,7 @@ export function useDashboardPage() {
   })
   const chartsBootstrapped = ref(false)
   const dashboardDataReady = ref(false)
+  const dashboardLoadSettled = ref(false)
   let dashboardEntrySeq = 0
   const modelLayoutIsMobile = ref<boolean | null>(null)
 
@@ -294,6 +295,7 @@ export function useDashboardPage() {
   function resetDashboardViewState() {
     cancelDashboardDataRequests()
     dashboardDataReady.value = false
+    dashboardLoadSettled.value = false
     stats.value = createDefaultStats()
     chartData.value = createEmptyChartData()
     overviewCache.clear()
@@ -638,7 +640,6 @@ export function useDashboardPage() {
         onError: (_message, error) => {
           console.error('Failed to refresh dashboard data:', error)
         },
-        silentError: true,
       },
     )
     return Boolean(refreshed)
@@ -650,10 +651,16 @@ export function useDashboardPage() {
     await nextTick()
     const refreshed = await refreshDashboardData(true)
     if (entrySeq !== dashboardEntrySeq) return
-    dashboardDataReady.value = true
+    dashboardLoadSettled.value = true
+    dashboardDataReady.value = refreshed
+    if (!refreshed) return
     await nextTick()
     if (entrySeq !== dashboardEntrySeq) return
     scheduleChartBootstrap(refreshed ? 0 : 80)
+  }
+
+  function retryDashboard() {
+    void reloadDashboardOnEnter()
   }
 
   async function loadChartData(chartType: ChartType, timeRange: DashboardTimeRange, requestId?: number) {
@@ -1045,6 +1052,9 @@ export function useDashboardPage() {
   return {
     stats,
     dashboardDataReady,
+    dashboardLoading: computed(() => dashboardDataQuery.loading.value || !dashboardLoadSettled.value),
+    dashboardLoadError: dashboardDataQuery.error,
+    retryDashboard,
     timeRangeHourlyRequests,
     timeRangeTrend,
     timeRangeSuccessRate,

@@ -30,6 +30,7 @@ from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
+    build_openai_oauth_export_account,
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
     sub2api_config,
@@ -70,7 +71,7 @@ class AccountRefreshRequest(BaseModel):
 
 class AccountExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
-    format: Literal["json", "zip"] = "json"
+    format: Literal["json", "zip", "cpa", "sub2api"] = "json"
 
 
 class AccountUpdateRequest(BaseModel):
@@ -755,12 +756,24 @@ def create_router() -> APIRouter:
             )
 
         timestamp = _download_timestamp()
-        if body.format == "zip":
+        if body.format in {"zip", "cpa"}:
             content = _account_zip_bytes(items)
             return Response(
                 content,
                 media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.zip"'},
+                headers={"Content-Disposition": f'attachment; filename="codex-accounts-cpa-{timestamp}.zip"'},
+            )
+
+        if body.format == "sub2api":
+            payload = {
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "proxies": [],
+                "accounts": [build_openai_oauth_export_account(item) for item in items],
+            }
+            return Response(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="openai-accounts-sub2api-{timestamp}.json"'},
             )
 
         payload: dict[str, str] | list[dict[str, str]] = items[0] if len(items) == 1 else items

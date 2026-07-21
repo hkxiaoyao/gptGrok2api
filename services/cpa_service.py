@@ -257,6 +257,11 @@ def _xai_auth_file_payload(account: dict) -> dict:
     return payload
 
 
+def build_xai_oauth_file(account: dict) -> tuple[str, dict]:
+    """Build one CLIProxyAPI-compatible xAI OAuth auth file without uploading it."""
+    return _xai_auth_file_name(account), _xai_auth_file_payload(account)
+
+
 def _codex_auth_file_name(account: dict) -> str:
     identity = str(account.get("email") or account.get("account_id") or "oauth").strip()
     safe_identity = re.sub(r"[^A-Za-z0-9@._-]+", "-", identity).strip("-._")[:120] or "oauth"
@@ -312,8 +317,7 @@ def _upload_auth_file(pool: dict, file_name: str, payload: dict, provider_label:
 
 def upload_xai_oauth_file(pool: dict, account: dict) -> dict:
     """Upload one xAI OAuth JSON file through CLIProxyAPI's management API."""
-    file_name = _xai_auth_file_name(account)
-    payload = _xai_auth_file_payload(account)
+    file_name, payload = build_xai_oauth_file(account)
     return _upload_auth_file(pool, file_name, payload, "xAI")
 
 

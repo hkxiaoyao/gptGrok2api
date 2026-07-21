@@ -922,8 +922,12 @@ def create_router(app_version: str) -> APIRouter:
         account_stats = await get_provider_account_stats()
         account_healthy = bool(account_stats.get("active")) or bool(account_stats.get("unlimited_quota_count"))
         storage = config.get_storage_backend()
-        call_logs = log_service.list(type=LOG_TYPE_CALL, limit=log_limit)
-        recent_log_summary = _dashboard_log_summary(call_logs, time_range=time_range)
+        call_logs = await run_in_threadpool(log_service.list, type=LOG_TYPE_CALL, limit=log_limit)
+        recent_log_summary = await run_in_threadpool(
+            _dashboard_log_summary,
+            call_logs,
+            time_range=time_range,
+        )
         await run_in_threadpool(dashboard_metrics_service.backfill_if_empty, call_logs)
         dashboard_logs = await run_in_threadpool(dashboard_metrics_service.summary, time_range)
         dashboard_logs["recent_failures"] = recent_log_summary.get("recent_failures", [])

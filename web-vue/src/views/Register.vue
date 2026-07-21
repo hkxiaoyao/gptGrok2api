@@ -85,6 +85,7 @@
                   @delete="deleteProvider"
                   @check-gptmail="checkGptMailStatus"
                   @outlook-action="handleOutlookPoolAction"
+                  @retry-outlook-failed="outlookPoolRuntime.retryFailedPool"
                 />
               </div>
             </FormSection>
@@ -99,6 +100,7 @@
             :runtime-hint="registerRuntimeHint"
             :metric-items="registerMetricItems"
             :runtime-log-lines="runtimeLogLines"
+            :grok-oauth-log-lines="grokOAuthRuntimeLogLines"
             :checkout-log-lines="checkoutRuntimeLogLines"
             @toggle-task="toggleLegacyTask"
             @reset-stats="resetLegacyStats"
@@ -314,6 +316,7 @@ const registerActionDisabled = computed(() => buildRegisterActionDisabled(
 ))
 const legacyStats = computed(() => ({ ...defaultRegisterConfig.stats, ...(registerConfig.value?.stats || {}) }))
 const legacyLogs = computed(() => (registerConfig.value?.logs || []).slice(-120))
+const grokOAuthLogs = computed(() => (registerConfig.value?.grok_oauth_logs || []).slice(-120))
 const checkoutLogs = computed(() => (registerConfig.value?.checkout_logs || []).slice(-120))
 const checkoutTasks = computed(() => Array.isArray(registerConfig.value?.checkout_tasks)
   ? [...registerConfig.value.checkout_tasks]
@@ -340,6 +343,7 @@ const registerMetricItems = computed(() => buildRegisterMetricItems(
 ))
 
 const runtimeLogLines = computed(() => buildRegisterRuntimeLogLines(legacyLogs.value, formatClock))
+const grokOAuthRuntimeLogLines = computed(() => buildRegisterRuntimeLogLines(grokOAuthLogs.value, formatClock))
 const checkoutRuntimeLogLines = computed(() => buildRegisterRuntimeLogLines(checkoutLogs.value, formatClock))
 const providerRuntime = useRegisterProviderRuntime({
   config: registerConfig,
@@ -368,25 +372,28 @@ function updateProviderField(index: number, key: string, value: unknown) {
   if (key === 'enable' && value === false) showDisabledProviders.value = true
 }
 
-function grokExportFilename() {
+function grokExportFilename(format: 'cpa' | 'sub2api') {
   const stamp = new Date().toISOString().slice(0, 19).replaceAll(':', '-')
-  return `grok-accounts-${stamp}.json`
+  return format === 'cpa'
+    ? `grok-accounts-cpa-${stamp}.zip`
+    : `grok-accounts-sub2api-${stamp}.json`
 }
 
-async function exportGrokAccounts() {
+async function exportGrokAccounts(format: 'cpa' | 'sub2api') {
+  const formatLabel = format === 'cpa' ? 'CPA ZIP' : 'Sub2API JSON'
   const confirmed = await confirmDialog.ask({
-    title: '导出 Grok 账号',
-    message: '导出文件包含账号认证信息，请确认在可信环境中保存。',
+    title: `导出 ${formatLabel}`,
+    message: `将导出已完成 OAuth 授权的 Grok 账号，文件包含完整认证信息，请在可信环境中保存。`,
     confirmText: '导出',
   })
   if (!confirmed) return
 
   grokExportBusy.value = true
   try {
-    const blob = await registerApi.exportGrokAccounts('json')
+    const blob = await registerApi.exportGrokAccounts(format)
     if (!blob.size) throw new Error('导出文件为空')
-    saveBlob(blob, grokExportFilename())
-    toast.success('Grok 账号已导出')
+    saveBlob(blob, grokExportFilename(format))
+    toast.success(`${formatLabel} 已导出`)
   } catch (error: any) {
     toast.error(error?.message || '导出 Grok 账号失败')
   } finally {

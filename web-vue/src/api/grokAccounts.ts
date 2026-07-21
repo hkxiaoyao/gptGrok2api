@@ -9,8 +9,22 @@ export type GrokAccountStatus =
   | 'submission_failed'
   | 'submission_unknown'
   | 'submission_unconfirmed'
-export type GrokAccountStatusFilter = 'all' | GrokAccountStatus | 'normal' | 'limited' | 'abnormal' | 'disabled' | 'refresh_failed' | 'probe_invalid' | 'probe_unknown'
-export type GrokAccountExportFormat = 'json' | 'txt'
+export type GrokAccountStatusFilter =
+  | 'all'
+  | GrokAccountStatus
+  | 'normal'
+  | 'limited'
+  | 'abnormal'
+  | 'disabled'
+  | 'refresh_failed'
+  | 'probe_invalid'
+  | 'probe_unknown'
+  | 'oauth_unauthorized'
+  | 'oauth_normal'
+  | 'oauth_limited'
+  | 'oauth_expired'
+  | 'oauth_invalid'
+export type GrokAccountExportFormat = 'sub2api' | 'cpa'
 export type GrokAccountSyncState =
   | 'synced'
   | 'not_synced'
@@ -132,6 +146,23 @@ export type GrokAccountsDisabledResponse = {
   error?: string
 }
 
+export type GrokAccountsOAuthAuthorizeResponse = {
+  summary: {
+    total: number
+    queued: number
+    reused: number
+    skipped: number
+    failed: number
+  }
+  results?: Array<{
+    id: string
+    ok: boolean
+    status: 'queued' | 'reused' | 'already_authorized' | 'failed'
+    job_id?: string
+    error?: string
+  }>
+}
+
 export type GrokAccountsRuntimeResponse = {
   summary: GrokAccountsMutationSummary
   results?: Array<{
@@ -140,6 +171,13 @@ export type GrokAccountsRuntimeResponse = {
     refresh_status?: 'success' | 'failed' | string
     error?: string
   }>
+  error?: string
+}
+
+export type GrokRuntimeSnapshotResponse = {
+  ok: boolean
+  refreshed: boolean
+  refreshing: boolean
   error?: string
 }
 
@@ -206,10 +244,23 @@ export const grokAccountsApi = {
     )
   },
 
+  authorizeOAuth(ids: string[]) {
+    return apiClient.post<{ ids: string[] }, GrokAccountsOAuthAuthorizeResponse>(
+      `${GROK_ACCOUNTS_PATH}/oauth/authorize`,
+      { ids },
+    )
+  },
+
   refreshRuntime(ids: string[]) {
     return apiClient.post<{ ids: string[] }, GrokAccountsRuntimeResponse>(
       `${GROK_ACCOUNTS_PATH}/runtime/refresh`,
       { ids },
+    )
+  },
+
+  refreshSnapshot() {
+    return apiClient.post<never, GrokRuntimeSnapshotResponse>(
+      `${GROK_ACCOUNTS_PATH}/runtime/snapshot`,
     )
   },
 
@@ -234,9 +285,11 @@ export const grokAccountsApi = {
     )
   },
 
-  export(format: GrokAccountExportFormat) {
-    return apiClient.get<never, Blob>(`${GROK_ACCOUNTS_PATH}/export`, {
-      params: { format },
+  export(ids: string[], format: GrokAccountExportFormat) {
+    return apiClient.post<{ ids: string[]; format: GrokAccountExportFormat }, Blob>(`${GROK_ACCOUNTS_PATH}/export`, {
+      ids: Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))),
+      format,
+    }, {
       responseType: 'blob',
     })
   },

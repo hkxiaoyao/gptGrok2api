@@ -306,6 +306,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
                     stage="consent",
                     message="协议授权失败",
                     error="consent form missing",
+                    retryable=True,
                 )
                 return
             self.service._update_protocol_job(
@@ -333,6 +334,40 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         job = self.service.get_protocol_authorization_job(started["job"]["id"])
         self.assertEqual(job["status"], "authorized")
 
+    async def test_background_protocol_does_not_retry_permanent_failure(self) -> None:
+        source = {"id": "grok-permanent", "email": "permanent@example.com", "password": "password"}
+        completed = threading.Event()
+        attempts = 0
+
+        async def run(job_id: str, _selected: dict[str, object], *, notify_failure: bool = True) -> None:
+            nonlocal attempts
+            self.assertFalse(notify_failure)
+            attempts += 1
+            self.service._update_protocol_job(
+                job_id,
+                status="failed",
+                stage="session",
+                message="协议授权失败",
+                error="invalid credentials",
+                retryable=False,
+            )
+
+        def event_sink(payload: dict[str, object]) -> None:
+            if payload.get("status") == "failed":
+                completed.set()
+
+        self.service.protocol_event_sink = event_sink
+        with patch.object(self.service, "_select_protocol_source_account", return_value=source), patch.object(
+            self.service,
+            "_run_protocol_authorization",
+            new=run,
+        ):
+            self.service.start_protocol_authorization_background("grok-permanent")
+            finished = await asyncio.to_thread(completed.wait, 2)
+
+        self.assertTrue(finished)
+        self.assertEqual(attempts, 1)
+
     def test_oauth_keeps_configured_solver_limit_during_registration(self) -> None:
         active = self.service._oauth_grok_config(
             {
@@ -344,6 +379,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(active["local_concurrency"], 3)
+        self.assertEqual(active["captcha_timeout"], 180)
 
         idle = self.service._oauth_grok_config(
             {
@@ -355,6 +391,7 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(idle["local_concurrency"], 3)
+        self.assertEqual(idle["captcha_timeout"], 180)
 
     async def test_background_protocol_runs_while_registration_is_active(self) -> None:
         source = {"id": "grok-immediate", "email": "immediate@example.com", "password": "password"}
@@ -414,8 +451,8 @@ class XaiCliOAuthServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["backfill"], 1)
         self.assertEqual(status["retry"], 1)
 
-    def test_protocol_worker_limit_is_three(self) -> None:
-        self.assertEqual(self.service._protocol_worker_limit(), 3)
+    def test_protocol_worker_limit_matches_default_local_solver_capacity(self) -> None:
+        self.assertEqual(self.service._protocol_worker_limit(), 2)
 
     def test_oauth_reuses_registration_upstream_proxy(self) -> None:
         profile = SimpleNamespace(proxy_url="socks5h://proxy.example:1080")

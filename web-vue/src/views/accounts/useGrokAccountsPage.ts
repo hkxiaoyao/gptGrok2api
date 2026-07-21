@@ -16,7 +16,8 @@ import { saveBlob } from '@/lib/downloads'
 import { errorMessage } from '@/lib/errorMessage'
 
 export type GrokAccountsViewMode = 'list' | 'cards'
-export type GrokAccountBulkAction = 'sync' | 'refresh' | 'disable' | 'enable' | 'delete'
+export type GrokAccountBulkAction = 'authorize' | 'sync' | 'refresh' | 'disable' | 'enable' | 'delete'
+export type GrokAccountExportScope = 'selected' | 'all'
 
 const DEFAULT_PAGE_SIZE = 20
 const LIST_REQUEST_KEY = 'grok-accounts:list'
@@ -40,11 +41,18 @@ export const grokAccountStatusFilterOptions = [
   { label: '探测未知', value: 'probe_unknown' },
   { label: '运行异常', value: 'abnormal' },
   { label: '运行禁用', value: 'disabled' },
+  { label: 'OAuth 未授权', value: 'oauth_unauthorized' },
+  { label: 'OAuth 正常', value: 'oauth_normal' },
+  { label: 'OAuth 限流', value: 'oauth_limited' },
+  { label: 'OAuth 过期', value: 'oauth_expired' },
+  { label: 'OAuth 失效', value: 'oauth_invalid' },
 ] as const satisfies ReadonlyArray<{ label: string; value: GrokAccountStatusFilter }>
 
 function exportFilename(format: GrokAccountExportFormat) {
   const stamp = new Date().toISOString().slice(0, 19).replaceAll(':', '-')
-  return `grok-accounts-${stamp}.${format}`
+  return format === 'cpa'
+    ? `grok-accounts-cpa-${stamp}.zip`
+    : `grok-accounts-sub2api-${stamp}.json`
 }
 
 export function useGrokAccountsPage() {
@@ -62,12 +70,14 @@ export function useGrokAccountsPage() {
   const selectedIds = ref<string[]>([])
   const batchBusy = ref(false)
   const batchActionLabel = ref('')
+  const authorizingAccountId = ref('')
   const syncingAccountId = ref('')
   const refreshingAccountId = ref('')
   const testingAccountId = ref('')
   const togglingAccountId = ref('')
   const removingAccountId = ref('')
   const exportBusy = ref(false)
+  const snapshotRefreshBusy = ref(false)
 
   const toast = useToast()
   const confirmDialog = useConfirmDialog()
@@ -134,6 +144,37 @@ export function useGrokAccountsPage() {
       silentError: options.silentErrorToast,
       silentLoading: options.silentLoading,
     })
+  }
+
+  async function refreshRuntimeSnapshot() {
+    if (snapshotRefreshBusy.value || !pageRuntime.canRun.value) return
+    snapshotRefreshBusy.value = true
+    try {
+      const result = await grokAccountsApi.refreshSnapshot()
+      if (!pageRuntime.canRun.value) return
+      if (!result.ok) {
+        runtimeError.value = String(result.error || 'Grok 运行时数据刷新失败').trim()
+        return
+      }
+      if (result.refreshing) {
+        pageRuntime.setTimer('grok-accounts:snapshot-retry', 1500, () => {
+          void refreshRuntimeSnapshot()
+        })
+        return
+      }
+      if (result.refreshed) {
+        await loadData({ silentErrorToast: true, silentLoading: true })
+      }
+    } catch (error) {
+      if (pageRuntime.canRun.value) runtimeError.value = errorMessage(error, 'Grok 运行时数据刷新失败')
+    } finally {
+      snapshotRefreshBusy.value = false
+    }
+  }
+
+  async function loadWithRuntimeSnapshot(options: { silentErrorToast?: boolean; silentLoading?: boolean } = {}) {
+    await loadData(options)
+    if (pageRuntime.canRun.value) void refreshRuntimeSnapshot()
   }
 
   function setViewMode(mode: GrokAccountsViewMode) {
@@ -209,6 +250,39 @@ export function useGrokAccountsPage() {
       return false
     } finally {
       endAction(syncingAccountId)
+    }
+  }
+
+  async function authorizeOAuth(accountIds: readonly string[]) {
+    if (batchBusy.value) return false
+    const ids = uniqueIds(accountIds)
+    if (!ids.length) return false
+    const confirmed = await confirmDialog.ask({
+      title: ids.length === 1 ? 'OAuth 授权' : '批量 OAuth 授权',
+      message: `即将把 ${ids.length} 个 Grok 账号加入 OAuth 协议授权队列。授权完成后会探测 Grok 4.5，并按现有配置自动上传到 NovaApi / CPA。是否继续？`,
+      confirmText: '开始授权',
+      cancelText: '取消',
+    })
+    if (!confirmed) return false
+
+    beginAction(ids, '正在排队 OAuth 授权...', authorizingAccountId)
+    try {
+      const result = await grokAccountsApi.authorizeOAuth(ids)
+      const queued = Number(result.summary?.queued || 0)
+      const reused = Number(result.summary?.reused || 0)
+      const skipped = Number(result.summary?.skipped || 0)
+      const failed = Number(result.summary?.failed || 0)
+      const detail = String(result.results?.find((item) => item.error)?.error || '').trim()
+      const message = `OAuth 授权：新排队 ${queued}，队列中 ${reused}，已授权跳过 ${skipped}，失败 ${failed}`
+      if (failed > 0) toast.warning(`${message}${detail ? `；${detail}` : ''}`)
+      else toast.success(message)
+      await loadData({ silentErrorToast: true })
+      return failed === 0
+    } catch (error) {
+      toast.error(`OAuth 授权排队失败：${errorMessage(error)}`)
+      return false
+    } finally {
+      endAction(authorizingAccountId)
     }
   }
 
@@ -362,7 +436,14 @@ export function useGrokAccountsPage() {
     }
     const selectedRows = accounts.value.filter((item) => ids.includes(item.id))
     const readyIds = selectedRows.filter((item) => item.has_sso).map((item) => item.id)
+    const unauthorizedIds = selectedRows
+      .filter((item) => !item.oauth && item.status === 'active' && item.has_password && item.has_sso)
+      .map((item) => item.id)
     const syncedIds = selectedRows.filter((item) => item.sync_state === 'synced').map((item) => item.id)
+    if (action === 'authorize') {
+      if (!unauthorizedIds.length) toast.warning('选中账号没有可授权的 OAuth 未授权账号')
+      else await authorizeOAuth(unauthorizedIds)
+    }
     if (action === 'sync') {
       if (!readyIds.length) toast.warning('选中账号都没有可加入运行池的 SSO 登录态')
       else await syncAccounts(readyIds)
@@ -382,16 +463,23 @@ export function useGrokAccountsPage() {
     if (action === 'delete') await removeAccounts(ids)
   }
 
-  async function exportAccounts(format: GrokAccountExportFormat = 'json') {
+  async function exportAccounts(scope: GrokAccountExportScope, format: GrokAccountExportFormat) {
     if (exportBusy.value) return
-    if (!accountAllTotal.value) {
+    const ids = scope === 'selected' ? [...selectedIds.value] : []
+    if (scope === 'selected' && !ids.length) {
+      toast.warning('请先选择要导出的 Grok 账号')
+      return
+    }
+    if (scope === 'all' && !accountAllTotal.value) {
       toast.warning('暂无可导出的 Grok 账号')
       return
     }
 
+    const formatLabel = format === 'cpa' ? 'CPA ZIP' : 'Sub2API JSON'
+    const scopeLabel = scope === 'selected' ? `选中的 ${ids.length} 个` : '全部可导出的'
     const confirmed = await confirmDialog.ask({
-      title: `导出 Grok 账号 ${format.toUpperCase()}`,
-      message: `即将导出全部 ${accountAllTotal.value} 个 Grok 账号。文件包含密码和 SSO 登录态，请只在可信环境保存。`,
+      title: `导出${scope === 'selected' ? '选中' : '全部'}账号为 ${formatLabel}`,
+      message: `即将导出${scopeLabel} Grok OAuth 账号。文件包含完整认证信息，请只在可信环境保存。`,
       confirmText: '确认导出',
       cancelText: '取消',
     })
@@ -399,10 +487,10 @@ export function useGrokAccountsPage() {
 
     exportBusy.value = true
     try {
-      const blob = await grokAccountsApi.export(format)
+      const blob = await grokAccountsApi.export(ids, format)
       if (!blob.size) throw new Error('导出文件为空')
       saveBlob(blob, exportFilename(format))
-      toast.success(`Grok 账号 ${format.toUpperCase()} 已导出`)
+      toast.success(`Grok 账号 ${formatLabel} 已导出`)
     } catch (error) {
       toast.error(`导出失败：${errorMessage(error)}`)
     } finally {
@@ -426,11 +514,11 @@ export function useGrokAccountsPage() {
   })
 
   pageRuntime.onActivate(() => {
-    void loadData()
+    void loadWithRuntimeSnapshot()
   })
 
   pageRuntime.onShow(() => {
-    void loadData({ silentErrorToast: true, silentLoading: true })
+    void loadWithRuntimeSnapshot({ silentErrorToast: true, silentLoading: true })
   })
 
   return {
@@ -463,6 +551,8 @@ export function useGrokAccountsPage() {
     clearSelection,
     batchBusy,
     batchActionLabel,
+    authorizingAccountId,
+    authorizeOAuth,
     syncingAccountId,
     syncAccounts,
     refreshingAccountId,

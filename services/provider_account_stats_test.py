@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -86,6 +87,34 @@ class ProviderAccountStatsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["total_quota"], 140)
         self.assertEqual(set(stats["providers"]), {"gpt", "grok"})
         oauth_list.assert_not_called()
+
+    async def test_slow_runtime_stats_degrade_without_blocking_other_sources(self) -> None:
+        async def slow_stats():
+            await asyncio.sleep(1)
+
+        fake_runtime = type(
+            "FakeRuntime",
+            (),
+            {
+                "available": True,
+                "account_stats": AsyncMock(side_effect=slow_stats),
+            },
+        )()
+        with (
+            patch.object(provider_account_stats, "PROVIDER_STATS_TIMEOUT_SECONDS", 0.01),
+            patch.object(
+                provider_account_stats.account_service,
+                "get_stats",
+                return_value={"total": 2, "active": 2, "total_quota": 20},
+            ),
+            patch.object(provider_account_stats, "grok_runtime", fake_runtime),
+            patch.object(provider_account_stats.xai_cli_oauth_store, "list_accounts", return_value=[]),
+        ):
+            stats = await provider_account_stats.get_provider_account_stats()
+
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["providers"]["gpt"]["active"], 2)
+        self.assertFalse(stats["providers"]["grok_runtime"]["source_available"])
 
 
 if __name__ == "__main__":

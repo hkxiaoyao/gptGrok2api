@@ -132,7 +132,7 @@ export const providerTypeKeys: Record<string, string[]> = {
 }
 
 export const providerLocalOnlyKeys: Record<string, string[]> = {
-  outlook_token: ['mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats'],
+  outlook_token: ['mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats', 'mailboxes_failed'],
 }
 
 export const defaultGrokRegisterConfig: GrokRegisterConfig = {
@@ -227,6 +227,7 @@ export const defaultRegisterConfig: LegacyRegisterConfig = {
     current_available: 0,
   },
   logs: [],
+  grok_oauth_logs: [],
 }
 
 export function providerType(provider: RegisterProvider) {
@@ -477,6 +478,7 @@ export function normalizeRegisterConfig(raw: LegacyRegisterConfig): LegacyRegist
     cpa_sync: cpaSync,
     stats: { ...defaultRegisterConfig.stats, ...(raw.stats || {}) },
     logs: Array.isArray(raw.logs) ? raw.logs : [],
+    grok_oauth_logs: Array.isArray(raw.grok_oauth_logs) ? raw.grok_oauth_logs : [],
   }
 }
 
@@ -624,6 +626,7 @@ export function sanitizedProviderPayload(provider: RegisterProvider): RegisterPr
   delete output.mailboxes_preview
   delete output.mailboxes_stats
   delete output.mailboxes_parse_stats
+  delete output.mailboxes_failed
   delete output.provider_ref
   return output
 }
@@ -923,7 +926,7 @@ export function outlookPoolHint(provider: RegisterProvider) {
   if (summary.pending > 0) return `有 ${summary.pending} 个待保存，保存配置后进入 Microsoft 邮箱池。`
   if (summary.saved <= 0) return '还没有保存 Microsoft 邮箱材料。'
   if (summary.invalid > 0) return `有 ${summary.invalid} 个异常邮箱，需要重新获取 refresh_token 或重新导入材料。`
-  if (summary.retryable > 0 || summary.inUse > 0) return `有 ${summary.retryable} 个临时失败、${summary.inUse} 个占用，可在更多维护里释放后重试。`
+  if (summary.retryable > 0 || summary.inUse > 0) return `有 ${summary.retryable} 个临时失败、${summary.inUse} 个占用；本次失败可在下方勾选重试。`
   if (summary.available <= 0) return '库存已用完，请导入新的 Microsoft 邮箱材料。'
   return `已保存 ${summary.saved} 个 Microsoft 邮箱材料。`
 }

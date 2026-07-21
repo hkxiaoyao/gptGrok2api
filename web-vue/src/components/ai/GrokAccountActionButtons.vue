@@ -60,6 +60,7 @@ const props = withDefaults(defineProps<{
   chatting?: boolean
   toggling?: boolean
   deleting?: boolean
+  authorizing?: boolean
   oauthAccount?: GrokOAuthAccount | null
   oauthAction?: string
   align?: 'start' | 'end'
@@ -72,6 +73,7 @@ const props = withDefaults(defineProps<{
   chatting: false,
   toggling: false,
   deleting: false,
+  authorizing: false,
   oauthAccount: null,
   oauthAction: '',
   align: 'start',
@@ -86,6 +88,7 @@ const emit = defineEmits<{
   (e: 'toggle-disabled'): void
   (e: 'remove'): void
   (e: 'oauth-sync'): void
+  (e: 'oauth-authorize'): void
   (e: 'oauth-refresh'): void
   (e: 'oauth-toggle'): void
   (e: 'oauth-remove'): void
@@ -114,7 +117,13 @@ const menuItems = computed<ActionMenuItem[]>(() => actionMenuGroups(
       disabled: !canManageRuntime.value || props.toggling,
     },
   ],
-  props.oauthAccount ? [
+  !props.oauthAccount ? [
+    {
+      key: 'oauth-authorize',
+      label: props.authorizing ? 'OAuth 排队中...' : 'OAuth 授权',
+      disabled: oauthActionBusy.value || props.authorizing || !props.item.has_password || !props.item.has_sso,
+    },
+  ] : [
     {
       key: 'oauth-sync',
       label: props.oauthAction === 'sync' ? 'OAuth 探测中...' : 'OAuth 探测模型',
@@ -138,7 +147,7 @@ const menuItems = computed<ActionMenuItem[]>(() => actionMenuGroups(
       disabled: oauthActionBusy.value,
       danger: true,
     },
-  ] : [],
+  ],
   [
     {
       key: 'remove',
@@ -155,6 +164,7 @@ function handleSelect(key: string) {
   if (key === 'toggle-disabled') emit('toggle-disabled')
   if (key === 'remove') emit('remove')
   if (key === 'oauth-sync') emit('oauth-sync')
+  if (key === 'oauth-authorize') emit('oauth-authorize')
   if (key === 'oauth-refresh') emit('oauth-refresh')
   if (key === 'oauth-toggle') emit('oauth-toggle')
   if (key === 'oauth-remove') emit('oauth-remove')

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from app.control.account.backends.local import LocalAccountRepository
 from app.control.account.commands import AccountPatch, AccountUpsert
@@ -10,6 +14,34 @@ from app.control.account.enums import QuotaSource
 
 
 class LocalAccountRepositoryTokenPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_initialization_is_serialized(self) -> None:
+        class FakeConnection:
+            row_factory = None
+
+            def execute(self, _statement: str):
+                return self
+
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        def connect(*_args, **_kwargs):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.01)
+            with guard:
+                active -= 1
+            return FakeConnection()
+
+        repo = LocalAccountRepository(Path("accounts.db"))
+        with patch("app.control.account.backends.local.sqlite3.connect", side_effect=connect):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(lambda _: repo._connect(), range(8)))
+
+        self.assertEqual(max_active, 1)
+
     async def test_console_quota_keeps_source_and_reset_time(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = LocalAccountRepository(Path(temp_dir) / "accounts.db")

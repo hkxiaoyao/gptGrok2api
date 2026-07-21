@@ -122,6 +122,213 @@ class DeviceConsentFormTest(unittest.TestCase):
         direct = XaiDeviceOAuthProtocol({}, proxy="direct")
         self.assertNotIn("proxy", direct._turnstile_solver_config())
 
+    def test_password_login_accepts_auth_x_ai_navigation(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client.base_url = "https://accounts.x.ai"
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        client.create_castle_token.return_value = "castle-token"
+        client._cookie_value_for_domain.return_value = "new-sso-token"
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://auth.x.ai/sign-in"},
+            ),
+            response(url="https://auth.x.ai/sign-in"),
+            response(
+                payload={
+                    "response": {
+                        "createSessionResponse": {
+                            "cookieSetterUrl": "https://grok.com/auth/callback",
+                        }
+                    }
+                }
+            ),
+            response(url="https://grok.com/"),
+        ]
+        solver = MagicMock()
+        solver.solve.return_value = "turnstile-token"
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client), patch(
+            "services.xai_device_oauth_protocol.TurnstileSolver",
+            return_value=solver,
+        ):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="password",
+                sso_only=True,
+            )
+
+        self.assertEqual(result, {"sso": "new-sso-token"})
+
+    def test_untrusted_navigation_error_reports_only_host_and_path(self) -> None:
+        client = MagicMock()
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        verify = MagicMock()
+        verify.status_code = 302
+        verify.url = "https://auth.x.ai/oauth2/device/verify"
+        verify.headers = {"location": "https://invalid.example/sign-in?secret=value"}
+        start = MagicMock()
+        start.status_code = 200
+        start.json.return_value = {
+            "device_code": "device-code",
+            "user_code": "ABCD-EFGH",
+            "expires_in": 300,
+        }
+        client._request.side_effect = [start, verify]
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client):
+            with self.assertRaisesRegex(
+                XaiDeviceOAuthProtocolError,
+                r"invalid\.example/sign-in$",
+            ):
+                XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                    email="person@example.com",
+                    password="password",
+                )
+
+    def test_password_login_accepts_relative_nested_cookie_setter_url(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client.base_url = "https://accounts.x.ai"
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        client.create_castle_token.return_value = "castle-token"
+        client._cookie_value_for_domain.return_value = "new-sso-token"
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/sign-in"},
+            ),
+            response(url="https://accounts.x.ai/sign-in"),
+            response(payload={"result": {"cookie_setter_url": "/auth/callback"}}),
+            response(url="https://accounts.x.ai/auth/callback"),
+        ]
+        solver = MagicMock()
+        solver.solve.return_value = "turnstile-token"
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client), patch(
+            "services.xai_device_oauth_protocol.TurnstileSolver",
+            return_value=solver,
+        ):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="password",
+                sso_only=True,
+            )
+
+        self.assertEqual(result, {"sso": "new-sso-token"})
+        self.assertEqual(client._request.call_args_list[4].args[1], "https://accounts.x.ai/auth/callback")
+
+    def test_full_oauth_continues_when_create_session_sets_cookies_directly(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        consent_html = DeviceConsentFormTest.HTML
+        client = MagicMock()
+        client.base_url = "https://accounts.x.ai"
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        client.create_castle_token.return_value = "castle-token"
+        client._cookie_value_for_domain.return_value = ""
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/sign-in"},
+            ),
+            response(url="https://accounts.x.ai/sign-in"),
+            response(payload={"response": {"createSessionResponse": {"authenticated": True}}}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/oauth2/device/consent"},
+            ),
+            response(url="https://accounts.x.ai/oauth2/device/consent", text=consent_html),
+            response(status=302, url="https://auth.x.ai/oauth2/device/approve"),
+            response(
+                payload={
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 21_600,
+                }
+            ),
+        ]
+        solver = MagicMock()
+        solver.solve.return_value = "turnstile-token"
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client), patch(
+            "services.xai_device_oauth_protocol.TurnstileSolver",
+            return_value=solver,
+        ):
+            result = XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                email="person@example.com",
+                password="password",
+            )
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(result["refresh_token"], "refresh-token")
+        self.assertEqual(client._request.call_count, 8)
+
+    def test_create_session_error_is_reported_before_consent_navigation(self) -> None:
+        def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
+            item = MagicMock()
+            item.status_code = status
+            item.url = url
+            item.headers = headers or {}
+            item.text = text
+            item.json.return_value = payload or {}
+            return item
+
+        client = MagicMock()
+        client.base_url = "https://accounts.x.ai"
+        client.bootstrap.return_value = SimpleNamespace(sitekey="turnstile-sitekey")
+        client.create_castle_token.return_value = "castle-token"
+        client._request.side_effect = [
+            response(payload={"device_code": "device-code", "user_code": "ABCD-EFGH", "expires_in": 300}),
+            response(
+                url="https://auth.x.ai/oauth2/device/verify",
+                headers={"location": "https://accounts.x.ai/sign-in"},
+            ),
+            response(url="https://accounts.x.ai/sign-in"),
+            response(payload={"response": {"error": {"code": "invalid_credentials", "message": "Login rejected"}}}),
+        ]
+        solver = MagicMock()
+        solver.solve.return_value = "turnstile-token"
+
+        with patch("services.xai_device_oauth_protocol.GrokProtocolClient", return_value=client), patch(
+            "services.xai_device_oauth_protocol.TurnstileSolver",
+            return_value=solver,
+        ):
+            with self.assertRaisesRegex(XaiDeviceOAuthProtocolError, "xAI 账号登录失败：invalid_credentials: Login rejected"):
+                XaiDeviceOAuthProtocol({}, proxy="direct").authorize(
+                    email="person@example.com",
+                    password="password",
+                )
+
+        self.assertEqual(client._request.call_count, 4)
+
     def test_password_login_can_return_grok_sso_without_device_consent(self) -> None:
         def response(*, status: int = 200, url: str = "", headers=None, payload=None, text: str = ""):
             item = MagicMock()

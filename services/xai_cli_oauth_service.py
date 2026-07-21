@@ -51,7 +51,7 @@ _DEVICE_SESSION_MAX_SECONDS = 1_800
 _ERROR_BODY_LIMIT = 1_200
 _PROTOCOL_JOB_TTL_SECONDS = 3_600
 _PROTOCOL_DEFER_POLL_SECONDS = 2.0
-_PROTOCOL_QUEUE_WORKERS = 3
+_PROTOCOL_QUEUE_WORKERS = 2
 _PROTOCOL_QUEUE_MAX_ATTEMPTS = 2
 _PROTOCOL_RETRY_STAGES = frozenset(
     {
@@ -456,6 +456,7 @@ class XaiCliOAuthService:
                 "stage": "queued",
                 "message": "等待开始协议授权",
                 "error": "",
+                "retryable": False,
                 "source_account_id": source_account_id,
                 "created_at": now,
                 "updated_at": now,
@@ -534,7 +535,13 @@ class XaiCliOAuthService:
     @staticmethod
     def _oauth_grok_config(runtime: dict[str, Any]) -> dict[str, Any]:
         source = runtime.get("grok") if isinstance(runtime.get("grok"), dict) else {}
-        return dict(source)
+        result = dict(source)
+        if _clean_text(result.get("provider")).lower() == "local":
+            attempt_timeout = max(15, min(120, int(result.get("local_attempt_timeout") or 60)))
+            queue_timeout = max(0, min(300, int(result.get("local_queue_timeout") or 60)))
+            configured_timeout = max(10, min(900, int(result.get("captcha_timeout") or 180)))
+            result["captcha_timeout"] = max(configured_timeout, attempt_timeout + queue_timeout + 15)
+        return result
 
     @staticmethod
     def _resolve_registration_proxy(raw_proxy: object) -> str:
@@ -574,7 +581,11 @@ class XaiCliOAuthService:
                         if _clean_text(job.get("status")) != "failed":
                             break
                         stage = _clean_text(job.get("stage"))
-                        if attempt >= _PROTOCOL_QUEUE_MAX_ATTEMPTS or stage not in _PROTOCOL_RETRY_STAGES:
+                        if (
+                            attempt >= _PROTOCOL_QUEUE_MAX_ATTEMPTS
+                            or stage not in _PROTOCOL_RETRY_STAGES
+                            or not bool(job.get("retryable"))
+                        ):
                             self._emit_protocol_event(
                                 {
                                     "status": "failed",
@@ -591,6 +602,7 @@ class XaiCliOAuthService:
                             stage="queued",
                             message=f"协议授权瞬时失败，准备重试（{attempt + 1}/{_PROTOCOL_QUEUE_MAX_ATTEMPTS}）",
                             error="",
+                            retryable=False,
                         )
                         time.sleep(_PROTOCOL_DEFER_POLL_SECONDS)
                 finally:
@@ -725,6 +737,7 @@ class XaiCliOAuthService:
                 stage=_clean_text(getattr(exc, "stage", "failed")) or "failed",
                 message="协议授权失败",
                 error=error[:500],
+                retryable=bool(getattr(exc, "retryable", False)),
             )
             if notify_failure:
                 self._emit_protocol_event(

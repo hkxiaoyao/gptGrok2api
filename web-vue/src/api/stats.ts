@@ -74,6 +74,7 @@ export const statsApi = {
       params: {
         time_range: timeRange,
       },
+      timeout: 20000,
     })
     return adaptDashboardToStats(dashboard)
   },

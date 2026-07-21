@@ -33,6 +33,11 @@ class OutlookPoolResetRequest(BaseModel):
     scope: str | None = None
 
 
+class OutlookPoolRetryRequest(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=128)
+    mailbox_ids: list[str] = Field(min_length=1)
+
+
 class GptMailStatusRequest(BaseModel):
     provider: dict | None = None
     force: bool | None = None
@@ -53,6 +58,11 @@ class GrokAccountDisabledRequest(GrokAccountIdsRequest):
 class GrokAccountChatTestRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=1_200)
     model: str | None = Field(default=None, max_length=128)
+
+
+class GrokAccountExportRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    format: Literal["sub2api", "cpa"] = "sub2api"
 
 
 def _grok_account_ids(values: list[str]) -> list[str]:
@@ -102,6 +112,22 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"register": register_service.reset_outlook_pool(body.scope or "all")}
 
+    @router.post("/api/register/outlook-pool/retry-selected")
+    async def retry_selected_outlook_mailboxes(
+        body: OutlookPoolRetryRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return {
+                "register": register_service.retry_outlook_failed(
+                    body.provider_id,
+                    body.mailbox_ids,
+                )
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.post("/api/register/gptmail/status")
     async def get_gptmail_status(body: GptMailStatusRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -147,6 +173,11 @@ def create_router() -> APIRouter:
             "runtime_error": str(view.get("runtime_error") or ""),
         }
 
+    @router.post("/api/register/grok/accounts/runtime/snapshot")
+    async def refresh_grok_runtime_snapshot(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(register_service.refresh_grok_runtime_snapshot)
+
     @router.get("/api/register/grok/accounts/{account_id}/credentials")
     async def get_grok_account_login_credentials(
         account_id: str,
@@ -173,6 +204,17 @@ def create_router() -> APIRouter:
         if not ids:
             raise HTTPException(status_code=400, detail={"error": "ids is required"})
         return await run_in_threadpool(register_service.sync_grok_accounts, ids)
+
+    @router.post("/api/register/grok/accounts/oauth/authorize")
+    async def authorize_grok_accounts_oauth(
+        body: GrokAccountIdsRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        ids = _grok_account_ids(body.ids)
+        if not ids:
+            raise HTTPException(status_code=400, detail={"error": "ids is required"})
+        return await run_in_threadpool(register_service.authorize_grok_accounts_oauth, ids)
 
     @router.post("/api/register/grok/accounts/runtime/refresh")
     async def refresh_grok_accounts_runtime(
@@ -244,26 +286,60 @@ def create_router() -> APIRouter:
 
     @router.get("/api/register/grok/accounts/export")
     async def export_grok_accounts(
-        format: Literal["json", "txt"] = "json",
+        format: Literal["sub2api", "cpa"] = "sub2api",
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        if format == "txt":
-            return Response(
-                register_service.export_grok_accounts_text(),
-                media_type="text/plain; charset=utf-8",
-                headers={
-                    "Cache-Control": "no-store",
-                    "Content-Disposition": f'attachment; filename="grok-accounts-{timestamp}.txt"',
-                },
-            )
+        try:
+            if format == "cpa":
+                return Response(
+                    register_service.export_grok_accounts_cpa(),
+                    media_type="application/zip",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Content-Disposition": f'attachment; filename="grok-accounts-cpa-{timestamp}.zip"',
+                    },
+                )
+            payload = register_service.export_grok_accounts_sub2api()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return Response(
-            json.dumps(register_service.export_grok_accounts(), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             media_type="application/json",
             headers={
                 "Cache-Control": "no-store",
-                "Content-Disposition": f'attachment; filename="grok-accounts-{timestamp}.json"',
+                "Content-Disposition": f'attachment; filename="grok-accounts-sub2api-{timestamp}.json"',
+            },
+        )
+
+    @router.post("/api/register/grok/accounts/export")
+    async def export_selected_grok_accounts(
+        body: GrokAccountExportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        ids = _grok_account_ids(body.ids)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        try:
+            if body.format == "cpa":
+                return Response(
+                    register_service.export_grok_accounts_cpa(ids or None),
+                    media_type="application/zip",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Content-Disposition": f'attachment; filename="grok-accounts-cpa-{timestamp}.zip"',
+                    },
+                )
+            payload = register_service.export_grok_accounts_sub2api(ids or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="grok-accounts-sub2api-{timestamp}.json"',
             },
         )
 

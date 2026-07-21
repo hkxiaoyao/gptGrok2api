@@ -282,6 +282,47 @@ def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None) -> dict[s
     return counts
 
 
+def outlook_token_pool_failures(
+    pool: list[dict[str, str]] | None = None,
+    *,
+    since: str = "",
+) -> list[dict[str, str]]:
+    """Return failed mailbox state entries in the configured pool since a batch started."""
+    with _outlook_token_state_lock:
+        store = _load_outlook_token_state()
+    since_at: datetime | None = None
+    if str(since or "").strip():
+        try:
+            parsed = datetime.fromisoformat(str(since).strip())
+            since_at = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            since_at = None
+    failures: list[dict[str, str]] = []
+    for credential in pool or []:
+        email = str(credential.get("email") or "").strip()
+        entry = store.get(email.lower()) if email else None
+        if not isinstance(entry, dict) or str(entry.get("state") or "") != "failed":
+            continue
+        updated_at = str(entry.get("updated_at") or "")
+        if since_at is not None:
+            try:
+                parsed_updated = datetime.fromisoformat(updated_at)
+                comparable = parsed_updated if parsed_updated.tzinfo else parsed_updated.replace(tzinfo=timezone.utc)
+                if comparable < since_at:
+                    continue
+            except ValueError:
+                continue
+        failures.append(
+            {
+                "email": email,
+                "reason": str(entry.get("reason") or ""),
+                "updated_at": updated_at,
+            }
+        )
+    failures.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return failures
+
+
 ResultT = TypeVar("ResultT")
 domain_lock = Lock()
 provider_lock = Lock()

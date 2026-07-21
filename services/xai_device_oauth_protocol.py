@@ -32,6 +32,7 @@ from services.xai_cli_oauth_protocol import (
 _DEVICE_VERIFY_URL = "https://auth.x.ai/oauth2/device/verify"
 _DEVICE_APPROVE_HOST = "auth.x.ai"
 _DEVICE_APPROVE_PATH = "/oauth2/device/approve"
+_ACCOUNT_NAVIGATION_HOSTS = {"accounts.x.ai", "auth.x.ai"}
 _ALLOWED_NAVIGATION_HOSTS = {
     "accounts.x.ai",
     "auth.x.ai",
@@ -76,7 +77,13 @@ def _validated_url(value: object, *, hosts: set[str], stage: str) -> str:
     url = _clean_text(value)
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in hosts:
-        raise XaiDeviceOAuthProtocolError("xAI returned an unexpected navigation URL", stage=stage)
+        host = parsed.hostname or "missing-host"
+        path = parsed.path or "/"
+        raise XaiDeviceOAuthProtocolError(
+            f"xAI returned an unexpected navigation URL: {host}{path[:200]}",
+            stage=stage,
+            retryable=True,
+        )
     return url
 
 
@@ -225,6 +232,38 @@ def _walk_json(value: Any):
             pending.extend(current)
 
 
+def _cookie_setter_url(payload: object) -> str:
+    """Read createSession's cookie URL across old and nested RPC envelopes."""
+    for node in _walk_json(payload):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if str(key).replace("_", "").lower() != "cookiesetterurl":
+                continue
+            url = _clean_text(value)
+            if url:
+                return url
+    return ""
+
+
+def _rpc_error_text(payload: object) -> str:
+    for node in _walk_json(payload):
+        if not isinstance(node, dict):
+            continue
+        error = node.get("error")
+        if isinstance(error, str) and _clean_text(error):
+            return _clean_text(error)[:300]
+        if isinstance(error, dict):
+            message = _clean_text(error.get("message") or error.get("detail") or error.get("description"))
+            code = _clean_text(error.get("code") or error.get("type"))
+            if message or code:
+                return f"{code}: {message}".strip(": ")[:300]
+        message = _clean_text(node.get("errorMessage") or node.get("error_message"))
+        if message:
+            return message[:300]
+    return ""
+
+
 def _flight_session_user_id(html: str) -> str:
     for record in _next_flight_records(html):
         for node in _walk_json(record):
@@ -356,7 +395,7 @@ class XaiDeviceOAuthProtocol:
             )
             sign_in_url = _validated_url(
                 urljoin(str(verify.url), _clean_text(verify.headers.get("location"))),
-                hosts={"accounts.x.ai"},
+                hosts=_ACCOUNT_NAVIGATION_HOSTS,
                 stage="signin",
             )
             sign_in = client._request(
@@ -367,7 +406,7 @@ class XaiDeviceOAuthProtocol:
             )
             if sign_in.status_code != 200:
                 raise XaiDeviceOAuthProtocolError("Unable to load xAI sign-in page", stage="signin", retryable=True)
-            sign_in_url = _validated_url(str(sign_in.url), hosts={"accounts.x.ai"}, stage="signin")
+            sign_in_url = _validated_url(str(sign_in.url), hosts=_ACCOUNT_NAVIGATION_HOSTS, stage="signin")
             sitekey = extract_turnstile_sitekey(str(sign_in.text or "")) or _clean_text(metadata.sitekey)
             if not sitekey:
                 raise XaiDeviceOAuthProtocolError("xAI sign-in page did not expose a Turnstile sitekey", stage="signin")
@@ -404,19 +443,35 @@ class XaiDeviceOAuthProtocol:
                 allow_redirects=False,
             )
             rpc_payload = _safe_json(rpc)
-            setter_url = _validated_url(
-                rpc_payload.get("cookieSetterUrl"),
-                hosts=_ALLOWED_NAVIGATION_HOSTS,
-                stage="session",
-            )
-            session = client._request(
-                "GET",
-                setter_url,
-                headers={"Accept": "text/html,application/xhtml+xml", "Referer": sign_in_url},
-                allow_redirects=True,
-            )
-            if session.status_code >= 400:
-                raise XaiDeviceOAuthProtocolError("xAI session cookie exchange failed", stage="session", retryable=True)
+            setter_value = _cookie_setter_url(rpc_payload)
+            if not setter_value:
+                rpc_error = _rpc_error_text(rpc_payload)
+                if rpc_error:
+                    normalized_error = rpc_error.lower()
+                    if "invalid-credentials" in normalized_error or "email or password" in normalized_error:
+                        rpc_error = "保存的邮箱或密码不正确"
+                    raise XaiDeviceOAuthProtocolError(
+                        f"xAI 账号登录失败：{rpc_error}",
+                        stage="session",
+                    )
+            if setter_value:
+                setter_url = _validated_url(
+                    urljoin(f"{client.base_url}/", setter_value),
+                    hosts=_ALLOWED_NAVIGATION_HOSTS,
+                    stage="session",
+                )
+                session = client._request(
+                    "GET",
+                    setter_url,
+                    headers={"Accept": "text/html,application/xhtml+xml", "Referer": sign_in_url},
+                    allow_redirects=True,
+                )
+                if session.status_code >= 400:
+                    raise XaiDeviceOAuthProtocolError(
+                        "xAI session cookie exchange failed",
+                        stage="session",
+                        retryable=True,
+                    )
 
             session_sso = client._cookie_value_for_domain("grok.com", "sso", "sso-rw")
             if sso_only:
@@ -439,7 +494,7 @@ class XaiDeviceOAuthProtocol:
             )
             consent_url = _validated_url(
                 urljoin(str(reverify.url), _clean_text(reverify.headers.get("location"))),
-                hosts={"accounts.x.ai"},
+                hosts=_ACCOUNT_NAVIGATION_HOSTS,
                 stage="consent",
             )
             consent = client._request(

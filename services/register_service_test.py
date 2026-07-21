@@ -1,21 +1,142 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import services.register_service as register_service_module
-from services.register import grok_register
+from services.register import grok_register, mail_provider
 from services.register.grok_account_store import GrokAccountStore
 from services.openai_checkout_service import CheckoutSessionError
 from services.register_service import RegisterService, _normalize
 
 
 class RegisterServiceGrokTest(unittest.TestCase):
+    def test_grok_account_exports_match_sub2api_and_cpa_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RegisterService(Path(temp_dir) / "register.json")
+            oauth_account = {
+                "email": "person@example.test",
+                "subject": "xai-subject",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "id_token": "id-token",
+                "token_type": "Bearer",
+                "expires_at": "2030-01-01T00:00:00+00:00",
+                "quota": {"remaining": 12},
+            }
+            with (
+                patch.object(
+                    register_service_module.xai_cli_oauth_store,
+                    "list_accounts",
+                    return_value=[oauth_account],
+                ),
+                patch.object(
+                    register_service_module.grok_account_store,
+                    "list_accounts",
+                    return_value=[{"email": "person@example.test", "sso": "sso-session"}],
+                ),
+                patch.object(
+                    register_service_module.grok_account_store,
+                    "get_accounts_by_ids",
+                    return_value=[{"email": "person@example.test", "sso": "sso-session"}],
+                ),
+            ):
+                sub2api_payload = service.export_grok_accounts_sub2api()
+                cpa_archive = service.export_grok_accounts_cpa()
+                selected_payload = service.export_grok_accounts_sub2api(["grok-selected"])
+
+            self.assertEqual(sub2api_payload["proxies"], [])
+            self.assertEqual(len(sub2api_payload["accounts"]), 1)
+            sub2api_account = sub2api_payload["accounts"][0]
+            self.assertEqual(sub2api_account["platform"], "grok")
+            self.assertEqual(sub2api_account["type"], "oauth")
+            self.assertEqual(sub2api_account["credentials"]["access_token"], "access-token")
+            self.assertEqual(sub2api_account["credentials"]["sso_token"], "sso-session")
+            self.assertEqual(sub2api_account["extra"]["grok_usage_snapshot"], {"remaining": 12})
+            self.assertEqual(len(selected_payload["accounts"]), 1)
+
+            with zipfile.ZipFile(io.BytesIO(cpa_archive)) as archive:
+                self.assertEqual(archive.namelist(), ["xai-person@example.test.json"])
+                cpa_payload = json.loads(archive.read(archive.namelist()[0]))
+            self.assertEqual(cpa_payload["type"], "xai")
+            self.assertEqual(cpa_payload["auth_kind"], "oauth")
+            self.assertEqual(cpa_payload["access_token"], "access-token")
+            self.assertEqual(cpa_payload["refresh_token"], "refresh-token")
+
+    def test_retry_selected_outlook_failures_uses_only_selected_mailboxes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "outlook_token_used.json"
+            with patch.object(mail_provider, "OUTLOOK_TOKEN_USED_FILE", state_file):
+                service = RegisterService(Path(temp_dir) / "register.json")
+                provider = {
+                    "id": "outlook-main",
+                    "type": "outlook_token",
+                    "enable": True,
+                    "mailboxes": "\n".join(
+                        f"user{index}@outlook.com----password-{index}----client-{index}----refresh-{index}"
+                        for index in range(6)
+                    ),
+                    "alias_enabled": False,
+                }
+                service._config["target"] = "openai"
+                service._config["mail"]["providers"] = [provider]
+                service._config["stats"] = {
+                    "started_at": "2020-01-01T00:00:00+00:00",
+                    "mailbox_batch_started_at": "2020-01-01T00:00:00+00:00",
+                }
+                for index in range(6):
+                    mail_provider._set_outlook_token_state(
+                        f"user{index}@outlook.com",
+                        "failed",
+                        f"user {index} failed",
+                    )
+                selected_emails = ["user1@outlook.com", "user4@outlook.com"]
+                selected_ids = [
+                    register_service_module._outlook_mailbox_id("outlook-main", email)
+                    for email in selected_emails
+                ]
+                runner = MagicMock()
+                runner.is_alive.return_value = False
+                backend = SimpleNamespace(worker=MagicMock())
+
+                with (
+                    patch.object(service, "_sync_backend_runtime", return_value=backend) as sync_runtime,
+                    patch.object(service, "_pool_metrics", return_value={"current_quota": 0, "current_available": 0}),
+                    patch.object(service, "_ensure_checkout_queue_locked"),
+                    patch.object(register_service_module.threading, "Thread", return_value=runner),
+                ):
+                    result = service.retry_outlook_failed("outlook-main", selected_ids)
+
+                runtime = sync_runtime.call_args.args[0]
+                retry_provider = runtime["mail"]["providers"][0]
+                retry_credentials = mail_provider.parse_outlook_credentials(retry_provider["mailboxes"])
+                remaining = mail_provider.outlook_token_pool_failures(
+                    mail_provider.parse_outlook_credentials(provider["mailboxes"])
+                )
+
+                self.assertEqual([item["email"] for item in retry_credentials], selected_emails)
+                self.assertFalse(retry_provider["alias_enabled"])
+                self.assertEqual(
+                    {item["email"] for item in remaining},
+                    {"user0@outlook.com", "user2@outlook.com", "user3@outlook.com", "user5@outlook.com"},
+                )
+                self.assertTrue(result["enabled"])
+                self.assertEqual(result["stats"]["retry_selected"], 2)
+                runner.start.assert_called_once_with()
+
+    def test_retry_selected_outlook_failures_requires_a_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RegisterService(Path(temp_dir) / "register.json")
+            with self.assertRaisesRegex(ValueError, "至少选择 1"):
+                service.retry_outlook_failed("outlook-main", [])
+
     def test_checkout_config_update_refreshes_active_retry_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = RegisterService(Path(temp_dir) / "register.json")
@@ -978,8 +1099,9 @@ class RegisterServiceGrokTest(unittest.TestCase):
             accounts = account_store.list_accounts(redacted=False)
             self.assertEqual(protocol_calls, [accounts[0]["id"]])
             self.assertTrue(
-                any("Grok OAuth 授权已启动" in entry["text"] for entry in service.get()["logs"])
+                any("Grok OAuth 授权已启动" in entry["text"] for entry in service.get()["grok_oauth_logs"])
             )
+            self.assertFalse(any("Grok OAuth 授权已启动" in entry["text"] for entry in service.get()["logs"]))
 
     def test_grok_runtime_overrides_icloud_without_mutating_saved_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

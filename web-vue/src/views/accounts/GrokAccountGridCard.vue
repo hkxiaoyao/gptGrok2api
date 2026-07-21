@@ -66,6 +66,7 @@
       :chatting="chatting"
       :toggling="toggling"
       :deleting="deleting"
+      :authorizing="authorizing"
       :oauth-account="item.oauth"
       :oauth-action="oauthAction"
       @credentials="emit('credentials', item)"
@@ -76,6 +77,7 @@
       @toggle-disabled="emit('toggle-disabled', item)"
       @remove="emit('remove', item)"
       @oauth-sync="emit('oauth-sync', item)"
+      @oauth-authorize="emit('oauth-authorize', item)"
       @oauth-refresh="emit('oauth-refresh', item)"
       @oauth-toggle="emit('oauth-toggle', item)"
       @oauth-remove="emit('oauth-remove', item)"
@@ -123,6 +125,7 @@ const props = withDefaults(defineProps<{
   chatting?: boolean
   toggling?: boolean
   deleting?: boolean
+  authorizing?: boolean
   oauthAction?: string
 }>(), {
   selected: false,
@@ -134,6 +137,7 @@ const props = withDefaults(defineProps<{
   chatting: false,
   toggling: false,
   deleting: false,
+  authorizing: false,
   oauthAction: '',
 })
 
@@ -149,6 +153,7 @@ const emit = defineEmits<{
   (e: 'toggle-disabled', item: GrokAccount): void
   (e: 'remove', item: GrokAccount): void
   (e: 'oauth-sync', item: GrokAccount): void
+  (e: 'oauth-authorize', item: GrokAccount): void
   (e: 'oauth-refresh', item: GrokAccount): void
   (e: 'oauth-toggle', item: GrokAccount): void
   (e: 'oauth-remove', item: GrokAccount): void

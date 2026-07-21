@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -37,24 +38,26 @@ class LocalAccountRepository:
     def __init__(self, db_path: Path) -> None:
         self._path = Path(db_path)
         self._lock = asyncio.Lock()
+        self._connect_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.OperationalError:
-            # WAL 模式在 NFS / 某些 Docker bind mount 文件系统上不支持，
-            # 静默 fallback 到默认 DELETE journal mode，功能不受影响。
-            pass
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        with self._connect_lock:
+            conn = sqlite3.connect(self._path, timeout=5.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.OperationalError:
+                # WAL 模式在 NFS / 某些 Docker bind mount 文件系统上不支持，
+                # 静默 fallback 到默认 DELETE journal mode，功能不受影响。
+                pass
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
 
     def _init_sync(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

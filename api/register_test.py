@@ -92,6 +92,40 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
         self.assertEqual(response.json(), response_payload)
         clear_history.assert_called_once_with()
 
+    def test_retry_selected_outlook_mailboxes_passes_exact_selection(self) -> None:
+        response_payload = {"enabled": True, "stats": {"retry_selected": 2}}
+        mailbox_ids = ["mailbox-1", "mailbox-4"]
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "retry_outlook_failed",
+            return_value=response_payload,
+        ) as retry_selected:
+            response = self.client.post(
+                "/api/register/outlook-pool/retry-selected",
+                json={"provider_id": "outlook-main", "mailbox_ids": mailbox_ids},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"register": response_payload})
+        retry_selected.assert_called_once_with("outlook-main", mailbox_ids)
+
+    def test_retry_selected_outlook_mailboxes_returns_bad_request_for_stale_selection(self) -> None:
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "retry_outlook_failed",
+            side_effect=ValueError("所选邮箱已不在本次失败列表中"),
+        ):
+            response = self.client.post(
+                "/api/register/outlook-pool/retry-selected",
+                json={
+                    "provider_id": "outlook-main",
+                    "mailbox_ids": ["stale-mailbox"],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("本次失败列表", response.json()["detail"])
+
     def test_list_grok_accounts_returns_200_when_runtime_is_unavailable(self) -> None:
         view = {
             "items": [{"id": "grok-one", "platform": "grok", "email": "us***r@example.com", "sync_state": "unknown"}],
@@ -111,6 +145,19 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
         self.assertFalse(response.json()["runtime_available"])
         self.assertEqual(response.json()["runtime_error"], "runtime unavailable")
         self.assertEqual(response.json()["items"], view["items"])
+
+    def test_refresh_grok_runtime_snapshot_uses_separate_endpoint(self) -> None:
+        payload = {"ok": True, "refreshed": True, "refreshing": False, "error": ""}
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "refresh_grok_runtime_snapshot",
+            return_value=payload,
+        ) as refresh_snapshot:
+            response = self.client.post("/api/register/grok/accounts/runtime/snapshot")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        refresh_snapshot.assert_called_once_with()
 
     def test_grok_account_login_credentials_are_no_store_and_exclude_sso(self) -> None:
         credentials = {"id": "grok-one", "email": "user@example.com", "password": "generated-password"}
@@ -137,6 +184,49 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], {"error": "Grok 账号不存在或已删除"})
+
+    def test_export_grok_accounts_supports_sub2api_format(self) -> None:
+        payload = {"exported_at": "2030-01-01T00:00:00+00:00", "proxies": [], "accounts": []}
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "export_grok_accounts_sub2api",
+            return_value=payload,
+        ):
+            response = self.client.get("/api/register/grok/accounts/export", params={"format": "sub2api"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertIn("grok-accounts-sub2api-", response.headers["content-disposition"])
+
+    def test_export_grok_accounts_supports_cpa_zip_format(self) -> None:
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "export_grok_accounts_cpa",
+            return_value=b"zip-content",
+        ):
+            response = self.client.get("/api/register/grok/accounts/export", params={"format": "cpa"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"zip-content")
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertIn("grok-accounts-cpa-", response.headers["content-disposition"])
+
+    def test_export_selected_grok_accounts_supports_scope_and_format(self) -> None:
+        payload = {"exported_at": "2030-01-01T00:00:00+00:00", "proxies": [], "accounts": []}
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service,
+            "export_grok_accounts_sub2api",
+            return_value=payload,
+        ) as export_accounts:
+            response = self.client.post(
+                "/api/register/grok/accounts/export",
+                json={"ids": [" grok-one ", "grok-one", "grok-two"], "format": "sub2api"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        export_accounts.assert_called_once_with(["grok-one", "grok-two"])
 
     def test_delete_grok_accounts_deduplicates_stable_ids(self) -> None:
         with patch.object(register_api, "require_admin"), patch.object(
@@ -167,6 +257,16 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
 
     def test_grok_runtime_action_endpoints_use_stable_ids(self) -> None:
         cases = [
+            (
+                "/api/register/grok/accounts/oauth/authorize",
+                {"ids": [" grok-one ", "grok-one", "grok-two"]},
+                "authorize_grok_accounts_oauth",
+                {
+                    "summary": {"total": 2, "queued": 1, "reused": 1, "skipped": 0, "failed": 0},
+                    "results": [],
+                },
+                (["grok-one", "grok-two"],),
+            ),
             (
                 "/api/register/grok/accounts/sync",
                 {"ids": [" grok-one ", "grok-one", "grok-two"]},

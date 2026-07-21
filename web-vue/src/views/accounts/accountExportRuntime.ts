@@ -6,6 +6,7 @@ import { useToast } from '@/composables/useToast'
 import { saveBlob } from '@/lib/downloads'
 
 type AccountExportScope = 'selected' | 'all' | 'auto'
+export type AccountExportFormat = 'cpa' | 'sub2api'
 
 type AccountExportRuntimeOptions = {
   accounts: Ref<Account[]>
@@ -15,7 +16,7 @@ type AccountExportRuntimeOptions = {
   setError: (prefix: string, error: unknown, notify?: boolean) => void
 }
 
-function createExportFilename(extension = 'json') {
+function createExportFilename(format: AccountExportFormat) {
   const now = new Date()
   const parts = [
     now.getFullYear(),
@@ -26,11 +27,9 @@ function createExportFilename(extension = 'json') {
     String(now.getMinutes()).padStart(2, '0'),
     String(now.getSeconds()).padStart(2, '0'),
   ]
-  return `accounts-export-${parts.join('')}.${extension}`
-}
-
-function uniqueTokens(tokens: string[]) {
-  return Array.from(new Set(tokens.map((token) => token.trim()).filter(Boolean)))
+  return format === 'cpa'
+    ? `codex-accounts-cpa-${parts.join('')}.zip`
+    : `openai-accounts-sub2api-${parts.join('')}.json`
 }
 
 export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
@@ -38,7 +37,8 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
   const toast = useToast()
   const confirmDialog = useConfirmDialog()
 
-  async function exportAccounts(scope: AccountExportScope = 'auto') {
+  async function exportAccounts(scope: AccountExportScope = 'auto', format: AccountExportFormat = 'sub2api') {
+    const formatLabel = format === 'cpa' ? 'CPA ZIP' : 'Sub2API JSON'
     const targetIds = new Set(scope === 'all' ? [] : options.selectedIds.value)
     if (scope === 'all' || (scope === 'auto' && targetIds.size === 0)) {
       const totalHint = options.accountAllTotal.value || options.accountListTotal.value || options.accounts.value.length
@@ -47,8 +47,8 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
         return
       }
       const confirmed = await confirmDialog.ask({
-        title: '导出全部账号认证',
-        message: `即将导出全部 ${totalHint} 个账号。导出文件可能包含 refresh_token、id_token 或 access token，请只在可信环境保存。是否继续？`,
+        title: `导出全部账号为 ${formatLabel}`,
+        message: `即将导出全部 ${totalHint} 个账号。文件包含完整 OAuth 认证信息，请只在可信环境保存。`,
         confirmText: '确认导出',
         cancelText: '取消',
       })
@@ -56,9 +56,9 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
 
       exportBusy.value = true
       try {
-        const blob = await accountsApi.exportAccounts([], 'json')
-        saveBlob(blob, createExportFilename('json'))
-        toast.success('已导出全部账号认证')
+        const blob = await accountsApi.exportAccounts([], format)
+        saveBlob(blob, createExportFilename(format))
+        toast.success(`已导出全部账号为 ${formatLabel}`)
       } catch (error) {
         options.setError('导出失败', error)
       } finally {
@@ -82,8 +82,8 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
 
     const exportScopeLabel = targetIds.size === 0 ? '全部' : '选中'
     const confirmed = await confirmDialog.ask({
-      title: '导出账号认证',
-      message: `即将导出${exportScopeLabel} ${targetAccounts.length} 个账号。导出文件可能包含 refresh_token、id_token 或 access token，请只在可信环境保存。是否继续？`,
+      title: `导出${exportScopeLabel}账号为 ${formatLabel}`,
+      message: `即将导出${exportScopeLabel} ${targetAccounts.length} 个账号。文件包含完整 OAuth 认证信息，请只在可信环境保存。`,
       confirmText: '确认导出',
       cancelText: '取消',
     })
@@ -91,24 +91,11 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
 
     exportBusy.value = true
     try {
-      const blob = await accountsApi.exportAccounts(targetAccounts.map((item) => item.id), 'json')
-      saveBlob(blob, createExportFilename('json'))
-      toast.success(`已导出 ${targetAccounts.length} 个完整认证账号`)
+      const blob = await accountsApi.exportAccounts(targetAccounts.map((item) => item.id), format)
+      saveBlob(blob, createExportFilename(format))
+      toast.success(`已导出 ${targetAccounts.length} 个账号为 ${formatLabel}`)
     } catch (error) {
-      const status = (error as { status?: number }).status
-      if (status !== 400) {
-        options.setError('导出失败', error)
-        return
-      }
-
-      const tokens = uniqueTokens(targetAccounts.map((item) => item.access_token || ''))
-      if (!tokens.length) {
-        options.setError('导出失败', error)
-        return
-      }
-
-      saveBlob(new Blob([`${tokens.join('\n')}\n`], { type: 'text/plain;charset=utf-8' }), createExportFilename('txt'))
-      toast.warning(`没有可导出的完整认证 JSON，已改为导出 ${tokens.length} 个 Access Token`)
+      options.setError('导出失败', error)
     } finally {
       exportBusy.value = false
     }

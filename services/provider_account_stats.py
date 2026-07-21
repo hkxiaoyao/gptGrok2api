@@ -21,6 +21,7 @@ STAT_KEYS = (
     "total_success",
     "total_fail",
 )
+PROVIDER_STATS_TIMEOUT_SECONDS = 5.0
 
 
 def _number(value: object) -> int:
@@ -151,11 +152,18 @@ async def _load_grok_oauth_stats() -> dict[str, Any]:
         return _empty("grok_oauth", source_available=False)
 
 
+async def _load_with_timeout(loader: Any, provider: str) -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(loader(), timeout=PROVIDER_STATS_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return _empty(provider, source_available=False)
+
+
 async def get_provider_account_stats() -> dict[str, Any]:
     gpt, grok_runtime_stats, grok_oauth = await asyncio.gather(
-        _load_gpt_stats(),
-        _load_grok_runtime_stats(),
-        _load_grok_oauth_stats(),
+        _load_with_timeout(_load_gpt_stats, "gpt"),
+        _load_with_timeout(_load_grok_runtime_stats, "grok_runtime"),
+        _load_with_timeout(_load_grok_oauth_stats, "grok_oauth"),
     )
     grok = _aggregate("grok", {"runtime": grok_runtime_stats, "oauth": grok_oauth})
     total = _aggregate("all", {"gpt": gpt, "grok": grok})
@@ -170,8 +178,8 @@ async def get_provider_account_stats() -> dict[str, Any]:
 
 async def get_image_account_stats() -> dict[str, Any]:
     gpt, grok_runtime_stats = await asyncio.gather(
-        _load_gpt_stats(),
-        _load_grok_runtime_stats(),
+        _load_with_timeout(_load_gpt_stats, "gpt"),
+        _load_with_timeout(_load_grok_runtime_stats, "grok_runtime"),
     )
     total = _aggregate("image", {"gpt": gpt, "grok": grok_runtime_stats})
     total["providers"] = {"gpt": gpt, "grok": grok_runtime_stats}

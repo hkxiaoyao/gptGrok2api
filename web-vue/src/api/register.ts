@@ -17,6 +17,13 @@ export type OutlookMailboxParseStats = {
   [key: string]: unknown
 }
 
+export type OutlookFailedMailbox = {
+  id: string
+  email: string
+  reason?: string
+  updated_at?: string
+}
+
 export type RegisterProvider = {
   id?: string
   provider_id?: string
@@ -55,6 +62,7 @@ export type RegisterProvider = {
   mailboxes_base_count?: number
   mailboxes_alias_count?: number
   mailboxes_preview?: string[]
+  mailboxes_failed?: OutlookFailedMailbox[]
   alias_enabled?: boolean
   alias_per_email?: number
   alias_prefix?: string
@@ -218,6 +226,11 @@ export type LegacyRegisterConfig = {
     text: string
     level?: string
   }>
+  grok_oauth_logs?: Array<{
+    time: string
+    text: string
+    level?: string
+  }>
   checkout_logs?: Array<{
     time: string
     text: string
@@ -273,13 +286,19 @@ export const registerApi = {
   resetOutlookPool(scope: 'all' | 'retryable' | 'invalid' | 'unused' | 'failed' = 'all') {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/outlook-pool/reset', { scope })
   },
+  retrySelectedOutlookMailboxes(providerId: string, mailboxIds: string[]) {
+    return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/outlook-pool/retry-selected', {
+      provider_id: providerId,
+      mailbox_ids: mailboxIds,
+    })
+  },
   getGptMailStatus(provider: RegisterProvider, force = true) {
     return apiClient.post<any, { status: GptMailStatus }>('/api/register/gptmail/status', { provider, force })
   },
   refreshGptMailKey(provider: RegisterProvider, force = true) {
     return apiClient.post<any, { status: GptMailStatus }>('/api/register/gptmail/refresh-key', { provider, force })
   },
-  exportGrokAccounts(format: 'json' | 'txt' = 'json') {
+  exportGrokAccounts(format: 'cpa' | 'sub2api' = 'sub2api') {
     return apiClient.get<never, Blob>('/api/register/grok/accounts/export', {
       params: { format },
       responseType: 'blob',

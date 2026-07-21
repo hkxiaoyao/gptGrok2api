@@ -4,6 +4,7 @@ import type { ActionMenuItem } from 'nanocat-ui'
 import { actionMenuGroups } from '@/components/ai/menuItems'
 import type { AccountBulkAction } from './accountBulkActionsRuntime'
 import type { AccountImportMode } from './accountImportRuntime'
+import type { AccountExportFormat } from './accountExportRuntime'
 
 type ReadableRef<T> = {
   readonly value: T
@@ -32,7 +33,7 @@ type AccountActionMenuRuntimeOptions = {
   selectedBindGroupId: WritableRef<string>
   openCreateModal: () => void
   openImportModal: (mode: AccountImportMode) => void
-  exportAccounts: (scope: AccountExportScope) => Promise<void>
+  exportAccounts: (scope: AccountExportScope, format: AccountExportFormat) => Promise<void>
   refreshAllAccounts: () => Promise<void>
   extractSelectedCheckout: () => Promise<void>
   runBulkAction: (action: AccountBulkAction) => Promise<void>
@@ -110,12 +111,16 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
     ],
   ))
 
-  const exportMenuItems = computed<ActionMenuItem[]>(() => actionMenuGroups(
+  const exportMenuItems = computed<AccountActionMenuItem[]>(() => actionMenuGroups<AccountActionMenuItem>(
     [
       {
         key: 'selected',
         label: `导出选中${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
         disabled: options.selectedCount.value === 0,
+        children: [
+          { key: 'selected_sub2api', label: 'Sub2API 格式 (.json)' },
+          { key: 'selected_cpa', label: 'CPA 格式 (.zip)' },
+        ],
       },
     ],
     [
@@ -123,6 +128,10 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
         key: 'all',
         label: '导出全部',
         disabled: options.accountAllTotal.value === 0,
+        children: [
+          { key: 'all_sub2api', label: 'Sub2API 格式 (.json)' },
+          { key: 'all_cpa', label: 'CPA 格式 (.zip)' },
+        ],
       },
     ],
   ))
@@ -207,9 +216,9 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
   }
 
   async function handleExportAction(key: string) {
-    if (key === 'selected' || key === 'all') {
-      await options.exportAccounts(key)
-    }
+    const match = key.match(/^(selected|all)_(sub2api|cpa)$/)
+    if (!match) return
+    await options.exportAccounts(match[1] as AccountExportScope, match[2] as AccountExportFormat)
   }
 
   return {

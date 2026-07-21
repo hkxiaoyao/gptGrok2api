@@ -42,6 +42,7 @@ const PROVIDER_RUNTIME_KEYS = [
   'mailboxes_preview',
   'mailboxes_stats',
   'mailboxes_parse_stats',
+  'mailboxes_failed',
 ] as const
 
 export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
@@ -126,6 +127,7 @@ export function useRegisterConfigRuntime(input: RegisterConfigRuntimeInput) {
     config.value.enabled = incoming.enabled
     config.value.stats = incoming.stats
     config.value.logs = incoming.logs
+    config.value.grok_oauth_logs = incoming.grok_oauth_logs
     config.value.checkout_logs = incoming.checkout_logs
     config.value.checkout_tasks = incoming.checkout_tasks
     config.value.checkout_retries_active = incoming.checkout_retries_active

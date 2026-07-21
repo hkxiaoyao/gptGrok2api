@@ -790,6 +790,7 @@ def _openai_sync_credentials(account: dict) -> dict[str, str]:
         ("idToken", "id_token"),
         ("email", "email"),
         ("user_id", "chatgpt_user_id"),
+        ("account_id", "chatgpt_account_id"),
         ("chatgpt_account_id", "chatgpt_account_id"),
         ("organization_id", "organization_id"),
         ("plan_type", "plan_type"),
@@ -806,6 +807,28 @@ def _openai_sync_credentials(account: dict) -> dict[str, str]:
     if expires_at:
         credentials["expires_at"] = expires_at
     return credentials
+
+
+def build_openai_oauth_export_account(account: dict) -> dict:
+    """Build one OpenAI account record matching Sub2API's data-export contract."""
+    extra = {
+        "import_source": "chatgpt2api_openai_export",
+        "synced_at": _now_iso(),
+    }
+    registered_at = _clean(account.get("created_at"))
+    if registered_at:
+        extra["registered_at"] = registered_at
+    return {
+        "name": _clean(account.get("email")) or _clean(account.get("user_id")) or "OpenAI OAuth Account",
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": _openai_sync_credentials(account),
+        "extra": extra,
+        "concurrency": 1,
+        "priority": 0,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": True,
+    }
 
 
 def _sync_idempotency_key(server: dict, account: dict) -> str:
@@ -852,6 +875,28 @@ def _xai_sync_credentials(account: dict) -> dict[str, str]:
     return credentials
 
 
+def build_xai_oauth_export_account(account: dict) -> dict:
+    """Build one account record matching Sub2API's admin data-export contract."""
+    extra = {
+        "import_source": "chatgpt2api_grok_export",
+        "synced_at": _now_iso(),
+    }
+    quota = account.get("quota")
+    if isinstance(quota, dict) and quota:
+        extra["grok_usage_snapshot"] = quota
+    return {
+        "name": _clean(account.get("email")) or _clean(account.get("subject")) or "xAI OAuth Account",
+        "platform": "grok",
+        "type": "oauth",
+        "credentials": _xai_sync_credentials(account),
+        "extra": extra,
+        "concurrency": 1,
+        "priority": 0,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": True,
+    }
+
+
 def _xai_sync_idempotency_key(server: dict, account: dict) -> str:
     stable_value = _clean(account.get("subject")) or _clean(account.get("email"))
     token_fingerprint = hashlib.sha256(_clean(account.get("refresh_token")).encode("utf-8")).hexdigest()
@@ -881,16 +926,7 @@ def sync_openai_account(server: dict, account: dict, sync_config: object) -> dic
     base_url = _clean(server.get("base_url"))
     if not base_url:
         raise Sub2APISyncError("Sub2API 连接缺少地址")
-    credentials = _openai_sync_credentials(account)
     group_id, group_name = _resolve_sync_group(server, settings)
-    account_name = _clean(account.get("email")) or _clean(account.get("user_id")) or "OpenAI OAuth Account"
-    extra = {
-        "import_source": "chatgpt2api_registration",
-        "synced_at": _now_iso(),
-    }
-    registered_at = _clean(account.get("created_at"))
-    if registered_at:
-        extra["registered_at"] = registered_at
 
     session = None
     try:
@@ -900,17 +936,13 @@ def sync_openai_account(server: dict, account: dict, sync_config: object) -> dic
             "Idempotency-Key": _sync_idempotency_key(server, account),
         }
         session = _server_session(server)
+        payload = build_openai_oauth_export_account(account)
+        payload["extra"]["import_source"] = "chatgpt2api_registration"
+        payload["group_ids"] = [group_id]
         response = session.post(
             f"{base_url.rstrip('/')}/api/v1/admin/accounts",
             headers=headers,
-            json={
-                "name": account_name,
-                "platform": "openai",
-                "type": "oauth",
-                "credentials": credentials,
-                "extra": extra,
-                "group_ids": [group_id],
-            },
+            json=payload,
             timeout=30,
         )
         if not response.ok:
@@ -952,9 +984,7 @@ def sync_xai_oauth_account(server: dict, account: dict, sync_config: object) -> 
     base_url = _clean(server.get("base_url"))
     if not base_url:
         raise Sub2APISyncError("Sub2API 连接缺少地址")
-    credentials = _xai_sync_credentials(account)
     group_id, group_name = _resolve_sync_group(server, settings, platform="grok")
-    account_name = _clean(account.get("email")) or _clean(account.get("subject")) or "xAI OAuth Account"
 
     session = None
     try:
@@ -964,20 +994,13 @@ def sync_xai_oauth_account(server: dict, account: dict, sync_config: object) -> 
             "Idempotency-Key": _xai_sync_idempotency_key(server, account),
         }
         session = _server_session(server)
+        payload = build_xai_oauth_export_account(account)
+        payload["extra"]["import_source"] = "chatgpt2api_grok_registration"
+        payload["group_ids"] = [group_id]
         response = session.post(
             f"{base_url.rstrip('/')}/api/v1/admin/accounts",
             headers=headers,
-            json={
-                "name": account_name,
-                "platform": "grok",
-                "type": "oauth",
-                "credentials": credentials,
-                "extra": {
-                    "import_source": "chatgpt2api_grok_registration",
-                    "synced_at": _now_iso(),
-                },
-                "group_ids": [group_id],
-            },
+            json=payload,
             timeout=30,
         )
         if not response.ok:

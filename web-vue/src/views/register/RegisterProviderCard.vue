@@ -542,6 +542,51 @@
       </div>
 
       <p class="register-preview-line">{{ outlookPoolHint(provider) }}</p>
+      <div v-if="failedMailboxes.length" class="register-outlook-failures">
+        <div class="register-outlook-failure-head">
+          <div>
+            <div class="register-outlook-failure-title">本次失败邮箱</div>
+            <p class="register-preview-line">勾选几个，就只释放并重试这几个邮箱。</p>
+          </div>
+          <div class="register-provider-actions">
+            <MetaChip size="xs" :tone="selectedFailedIds.length ? 'warning' : 'muted'">
+              已选 {{ selectedFailedIds.length }}
+            </MetaChip>
+            <Button
+              size="sm"
+              variant="ghost"
+              :disabled="disabled || saving"
+              @click="selectFirstFailedMailboxes"
+            >
+              选前 5 个
+            </Button>
+          </div>
+        </div>
+
+        <div class="register-outlook-failure-list">
+          <div v-for="mailbox in failedMailboxes" :key="mailbox.id" class="register-outlook-failure-row">
+            <Checkbox
+              :model-value="selectedFailedIds.includes(mailbox.id)"
+              :disabled="disabled || saving"
+              @update:model-value="value => toggleFailedMailbox(mailbox.id, Boolean(value))"
+            >
+              <span class="register-outlook-failure-email">{{ mailbox.email }}</span>
+            </Checkbox>
+            <p class="register-outlook-failure-reason">{{ mailbox.reason || '未记录失败原因' }}</p>
+          </div>
+        </div>
+
+        <div class="register-outlook-failure-actions">
+          <Button
+            size="sm"
+            variant="outline"
+            :disabled="disabled || saving || selectedFailedIds.length === 0"
+            @click="retrySelectedFailedMailboxes"
+          >
+            {{ selectedFailedIds.length ? `重试所选 ${selectedFailedIds.length}` : '重试所选' }}
+          </Button>
+        </div>
+      </div>
       <details class="register-outlook-details">
         <summary>邮箱池详情</summary>
         <div class="register-outlook-detail-chips">
@@ -558,11 +603,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Button, Checkbox, Input } from 'nanocat-ui'
 import type { ActionMenuItem } from 'nanocat-ui'
 
-import type { GptMailStatus, RegisterProvider } from '@/api/register'
+import type { GptMailStatus, OutlookFailedMailbox, RegisterProvider } from '@/api/register'
 import FloatingActionMenu from '@/components/ai/FloatingActionMenu.vue'
 import FormSection from '@/components/ai/FormSection.vue'
 import MetaChip from '@/components/ai/MetaChip.vue'
@@ -624,11 +669,39 @@ const emit = defineEmits<{
   (e: 'delete', index: number): void
   (e: 'check-gptmail', index: number, provider: RegisterProvider): void
   (e: 'outlook-action', key: string): void
+  (e: 'retry-outlook-failed', providerId: string, mailboxIds: string[]): void
 }>()
 
 const currentType = computed(() => providerType(props.provider))
 const requirementMessages = computed(() => providerRequirementMessages(props.provider))
 const outlookSummary = computed(() => outlookPoolSummary(props.provider))
+const failedMailboxes = computed<OutlookFailedMailbox[]>(() => (
+  Array.isArray(props.provider.mailboxes_failed) ? props.provider.mailboxes_failed : []
+))
+const selectedFailedIds = ref<string[]>([])
+
+watch(failedMailboxes, (mailboxes) => {
+  const available = new Set(mailboxes.map(mailbox => mailbox.id))
+  selectedFailedIds.value = selectedFailedIds.value.filter(id => available.has(id))
+})
+
+function toggleFailedMailbox(mailboxId: string, selected: boolean) {
+  if (!selected) {
+    selectedFailedIds.value = selectedFailedIds.value.filter(id => id !== mailboxId)
+    return
+  }
+  if (selectedFailedIds.value.includes(mailboxId)) return
+  selectedFailedIds.value = [...selectedFailedIds.value, mailboxId]
+}
+
+function selectFirstFailedMailboxes() {
+  selectedFailedIds.value = failedMailboxes.value.slice(0, 5).map(mailbox => mailbox.id)
+}
+
+function retrySelectedFailedMailboxes() {
+  const providerId = String(props.provider.id || props.provider.provider_id || '').trim()
+  emit('retry-outlook-failed', providerId, selectedFailedIds.value)
+}
 
 function numberModelValue(value: unknown) {
   const parsed = Number.parseFloat(String(value))
@@ -709,6 +782,63 @@ function numberModelValue(value: unknown) {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.register-outlook-failures {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid hsl(var(--border) / 0.72);
+  padding-top: 12px;
+}
+
+.register-outlook-failure-head,
+.register-outlook-failure-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.register-outlook-failure-title {
+  font-size: 12px;
+  font-weight: 650;
+  color: hsl(var(--foreground));
+}
+
+.register-outlook-failure-list {
+  display: grid;
+  gap: 1px;
+  max-height: 320px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid hsl(var(--border) / 0.72);
+  border-radius: 8px;
+  background: hsl(var(--border) / 0.5);
+}
+
+.register-outlook-failure-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: hsl(var(--background));
+}
+
+.register-outlook-failure-email {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.register-outlook-failure-reason {
+  margin: 0 0 0 26px;
+  overflow-wrap: anywhere;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.register-outlook-failure-actions {
+  justify-content: flex-end;
 }
 
 .register-gptmail-panel {
@@ -851,6 +981,15 @@ function numberModelValue(value: unknown) {
 
   .register-outlook-toolbar {
     display: grid;
+  }
+
+  .register-outlook-failure-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .register-outlook-failure-head .register-provider-actions {
+    justify-content: flex-start;
   }
 }
 </style>

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import random
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from services.account_service import account_service
+from services import cpa_service
 from services.config import DATA_DIR
 from services.cpa_service import normalize_cpa_delivery_config
 from services.json_file import read_json_object, write_json_file
@@ -20,7 +24,7 @@ from services.openai_checkout_service import CheckoutSessionError, openai_checko
 from services.proxy_service import normalize_proxy_url_list
 from services.register import mail_provider, openai_register
 from services.register.grok_account_store import grok_account_store
-from services.sub2api_service import normalize_sync_config
+from services.sub2api_service import build_xai_oauth_export_account, normalize_sync_config
 from services.xai_oauth_delivery_service import (
     DEFAULT_XAI_OAUTH_DELIVERY_CONFIG,
     normalize_xai_oauth_delivery_config,
@@ -80,7 +84,6 @@ _GROK_QUOTA_MODES = ("auto", "fast", "expert", "heavy", "console")
 _GROK_RECOVERY_BASE_DELAY_MINUTES = 60
 _GROK_RECOVERY_MAX_DELAY_MINUTES = 24 * 60
 _GROK_OAUTH_RECOVERY_STALE_MINUTES = 24 * 60
-_GROK_OAUTH_BACKFILL_LIMIT = 500
 _GROK_PERMISSION_RETRY_DELAY_SECONDS = 15 * 60
 _GROK_PERMISSION_RETRY_BATCH_SIZE = 3
 _GROK_PENDING_STATUSES = {
@@ -417,6 +420,11 @@ def _ensure_provider_id(provider: dict) -> str:
     return provider_id
 
 
+def _outlook_mailbox_id(provider_id: str, email: str) -> str:
+    source = f"{str(provider_id).strip()}\0{str(email).strip().lower()}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
 def _default_config() -> dict:
     return {
         **openai_register.config,
@@ -599,7 +607,10 @@ class RegisterService:
         self._grok_probe_running = False
         self._grok_probe_scheduler_thread: threading.Thread | None = None
         self._grok_probe_wake_event = threading.Event()
+        self._grok_runtime_snapshot_lock = threading.Lock()
+        self._grok_runtime_snapshot_error = ""
         self._logs: list[dict] = []
+        self._grok_oauth_logs: list[dict] = []
         self._checkout_logs: list[dict] = []
         self._checkout_tasks: list[dict] = []
         self._checkout_task_run_id = ""
@@ -644,8 +655,7 @@ class RegisterService:
             runtime["mode"] = "total"
         return runtime
 
-    def _sync_backend_config(self, target: str | None = None):
-        runtime = self._runtime_config(target)
+    def _sync_backend_runtime(self, runtime: dict):
         backend = _registration_backend(runtime["target"])
         backend.register_log_sink = self._append_log
         backend.register_checkout_log_sink = self._append_checkout_log
@@ -665,6 +675,9 @@ class RegisterService:
             }
         )
         return backend
+
+    def _sync_backend_config(self, target: str | None = None):
+        return self._sync_backend_runtime(self._runtime_config(target))
 
     def _sync_icloud_claims(self) -> None:
         mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
@@ -699,6 +712,7 @@ class RegisterService:
                     {
                         **self._config,
                         "logs": self._logs[-300:],
+                        "grok_oauth_logs": self._grok_oauth_logs[-300:],
                         "checkout_logs": self._checkout_logs[-300:],
                         "checkout_tasks": self._checkout_tasks[-300:],
                         "checkout_retries_active": (
@@ -731,9 +745,13 @@ class RegisterService:
         providers = mail.get("providers")
         if not isinstance(providers, list):
             return
+        stats = snapshot.get("stats") if isinstance(snapshot.get("stats"), dict) else {}
+        batch_started_at = str(stats.get("mailbox_batch_started_at") or stats.get("started_at") or "")
         for index, provider in enumerate(providers):
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
+            provider_id = _provider_id(provider) or f"outlook-{index}"
+            provider["id"] = provider_id
             pool_text = str(provider.get("mailboxes") or "")
             base_credentials = mail_provider.parse_outlook_credentials(pool_text)
             credentials = mail_provider.expand_outlook_aliases(base_credentials, provider)
@@ -744,6 +762,18 @@ class RegisterService:
             provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
             provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
             provider["mailboxes_parse_stats"] = mail_provider.inspect_outlook_credentials(pool_text)
+            provider["mailboxes_failed"] = [
+                {
+                    "id": _outlook_mailbox_id(provider_id, item["email"]),
+                    "email": self._mask_email(item["email"]),
+                    "reason": item.get("reason") or "",
+                    "updated_at": item.get("updated_at") or "",
+                }
+                for item in mail_provider.outlook_token_pool_failures(
+                    credentials,
+                    since=batch_started_at,
+                )
+            ]
 
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
@@ -812,7 +842,7 @@ class RegisterService:
                 provider["mailboxes"] = _merge_outlook_pool(old_text, "")
             else:
                 provider["mailboxes"] = ""
-            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_failed"):
                 provider.pop(key, None)
 
     def _prune_unused_outlook_pools(self) -> int:
@@ -831,7 +861,7 @@ class RegisterService:
             if removed:
                 provider["mailboxes"] = _serialize_outlook_pool(kept)
                 total_removed += removed
-            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "mailboxes_parse_stats", "mailboxes_failed"):
                 provider.pop(key, None)
         return total_removed
 
@@ -875,7 +905,19 @@ class RegisterService:
             self._logs = []
             metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
             job_id = uuid.uuid4().hex
-            self._config["stats"] = {"job_id": job_id, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
+            started_at = _now()
+            self._config["stats"] = {
+                "job_id": job_id,
+                "success": 0,
+                "fail": 0,
+                "done": 0,
+                "running": 0,
+                "threads": self._config["threads"],
+                **metrics,
+                "started_at": started_at,
+                "mailbox_batch_started_at": started_at,
+                "updated_at": started_at,
+            }
             if target == "openai":
                 self._ensure_checkout_queue_locked()
                 with openai_register.stats_lock:
@@ -1019,7 +1061,7 @@ class RegisterService:
                 removed = self._prune_unused_outlook_pools()
                 self._sync_backend_config()
                 self._save()
-                self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
+                self._append_log(f"已删除 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
         scope_aliases = {"failed": "retryable", "retryable": "retryable", "invalid": "invalid", "all": "all"}
         scope = scope_aliases.get(scope, "all")
@@ -1031,6 +1073,106 @@ class RegisterService:
                 "yellow",
             )
         return self.get()
+
+    def retry_outlook_failed(self, provider_id: str, mailbox_ids: list[str]) -> dict:
+        selected_ids = list(dict.fromkeys(str(value or "").strip() for value in mailbox_ids if str(value or "").strip()))
+        if not selected_ids:
+            raise ValueError("请至少选择 1 个本次失败邮箱")
+        requested_provider_id = str(provider_id or "").strip()
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                raise ValueError("注册任务运行中，请等待当前任务结束")
+            mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+            providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+            matched_provider: dict | None = None
+            matched_provider_id = ""
+            for index, item in enumerate(providers):
+                if not isinstance(item, dict) or item.get("type") != "outlook_token":
+                    continue
+                item_id = _provider_id(item) or f"outlook-{index}"
+                if item_id == requested_provider_id:
+                    matched_provider = item
+                    matched_provider_id = item_id
+                    break
+            if matched_provider is None:
+                raise ValueError("Outlook 邮箱池配置不存在或已更改")
+
+            base_credentials = mail_provider.parse_outlook_credentials(str(matched_provider.get("mailboxes") or ""))
+            credentials = mail_provider.expand_outlook_aliases(base_credentials, matched_provider)
+            stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+            batch_started_at = str(stats.get("mailbox_batch_started_at") or stats.get("started_at") or "")
+            current_failures = {
+                item["email"].strip().lower(): item
+                for item in mail_provider.outlook_token_pool_failures(credentials, since=batch_started_at)
+            }
+            credential_by_id = {
+                _outlook_mailbox_id(matched_provider_id, credential["email"]): credential
+                for credential in credentials
+                if credential["email"].strip().lower() in current_failures
+            }
+            selected_credentials: list[dict[str, str]] = []
+            for mailbox_id in selected_ids:
+                credential = credential_by_id.get(mailbox_id)
+                if credential is None:
+                    raise ValueError("所选邮箱已不在本次失败列表中，请刷新后重选")
+                selected_credentials.append(credential)
+
+            target = str(self._config.get("target") or "openai").strip().lower()
+            runtime = self._runtime_config(target)
+            retry_provider = json.loads(json.dumps(matched_provider, ensure_ascii=False))
+            retry_provider["mailboxes"] = _serialize_outlook_pool(selected_credentials)
+            retry_provider["alias_enabled"] = False
+            retry_provider["alias_per_email"] = 0
+            runtime_mail = runtime.get("mail") if isinstance(runtime.get("mail"), dict) else {}
+            runtime_mail["providers"] = [retry_provider]
+            runtime["mail"] = runtime_mail
+            runtime["mode"] = "total"
+            runtime["total"] = len(selected_credentials)
+            runtime["threads"] = min(max(1, int(runtime.get("threads") or 1)), len(selected_credentials))
+            backend = self._sync_backend_runtime(runtime)
+
+            cleared = mail_provider.clear_outlook_token_states(
+                [item["email"] for item in selected_credentials],
+                states=mail_provider.OUTLOOK_RETRYABLE_STATES,
+            )
+            if cleared != len(selected_credentials):
+                raise ValueError("部分所选邮箱状态已变更，请刷新后重选")
+
+            started_at = _now()
+            metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
+            self._config["enabled"] = True
+            self._logs = []
+            self._config["stats"] = {
+                "job_id": uuid.uuid4().hex,
+                "success": 0,
+                "fail": 0,
+                "done": 0,
+                "running": 0,
+                "threads": runtime["threads"],
+                **metrics,
+                "started_at": started_at,
+                "mailbox_batch_started_at": batch_started_at or started_at,
+                "updated_at": started_at,
+                "retry_selected": len(selected_credentials),
+            }
+            if target == "openai":
+                self._ensure_checkout_queue_locked()
+                with openai_register.stats_lock:
+                    openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
+            self._save()
+            run_options = {"mode": "total", "total": len(selected_credentials), "threads": runtime["threads"]}
+            self._runner = threading.Thread(
+                target=self._run,
+                args=(target, backend, run_options),
+                daemon=True,
+                name=f"{target}-outlook-retry",
+            )
+            self._append_log(
+                f"已启动所选 Outlook 失败邮箱重试：{len(selected_credentials)} 个，其他邮箱保持原状态",
+                "yellow",
+            )
+            self._runner.start()
+            return self.get()
 
     def _mail_config_with_proxy(self) -> dict:
         mail = json.loads(json.dumps(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, ensure_ascii=False))
@@ -1083,6 +1225,39 @@ class RegisterService:
         runtime is represented by its separate, non-secret ``runtime`` field.
         """
         return grok_account_store.reconcile_runtime_accounts(self._runtime_tokens(client.list()))
+
+    def refresh_grok_runtime_snapshot(self) -> dict[str, Any]:
+        """Refresh the local runtime cache without blocking account-list reads."""
+        if not self._grok_runtime_snapshot_lock.acquire(blocking=False):
+            return {"ok": True, "refreshed": False, "refreshing": True, "error": ""}
+        try:
+            client = self._grok2api_client()
+            ready, readiness_error = client.readiness()
+            if not ready:
+                error = self._grok2api_error_text(RuntimeError(readiness_error))
+                with self._lock:
+                    self._grok_runtime_snapshot_error = error
+                return {"ok": False, "refreshed": False, "refreshing": False, "error": error}
+
+            try:
+                result = self._reconcile_grok_runtime_archive(client)
+            except Exception as exc:
+                error = self._grok2api_error_text(exc)
+                with self._lock:
+                    self._grok_runtime_snapshot_error = error
+                return {"ok": False, "refreshed": False, "refreshing": False, "error": error}
+
+            with self._lock:
+                self._grok_runtime_snapshot_error = ""
+            return {
+                "ok": True,
+                "refreshed": True,
+                "refreshing": False,
+                "error": "",
+                "summary": result,
+            }
+        finally:
+            self._grok_runtime_snapshot_lock.release()
 
     def _sync_grok_account_to_runtime(self, item: dict[str, Any], client=None) -> dict[str, Any]:
         account_id = _clean_text(item.get("id"))
@@ -1151,6 +1326,103 @@ class RegisterService:
         ok = sum(1 for item in results if item.get("ok"))
         return {"summary": {"total": len(results), "ok": ok, "fail": len(results) - ok}, "results": results}
 
+    def authorize_grok_accounts_oauth(self, ids: list[str]) -> dict[str, Any]:
+        ordered_ids = list(dict.fromkeys(_clean_text(value) for value in ids if _clean_text(value)))
+        raw_items = grok_account_store.get_accounts_by_ids(ordered_ids)
+        by_id = {_clean_text(item.get("id")): item for item in raw_items}
+        linked_emails = {
+            _clean_text(item.get("email")).lower()
+            for item in xai_cli_oauth_store.list_accounts(redacted=False)
+            if isinstance(item, dict) and _clean_text(item.get("email"))
+        }
+        summary = {
+            "total": len(ordered_ids),
+            "queued": 0,
+            "reused": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        results: list[dict[str, Any]] = []
+
+        for account_id in ordered_ids:
+            source = by_id.get(account_id)
+            if source is None:
+                summary["failed"] += 1
+                results.append({"id": account_id, "ok": False, "status": "failed", "error": "Grok 账号不存在"})
+                continue
+
+            email = _clean_text(source.get("email"))
+            if email.lower() in linked_emails:
+                summary["skipped"] += 1
+                results.append({"id": account_id, "ok": True, "status": "already_authorized"})
+                continue
+
+            missing = []
+            if _clean_text(source.get("status")).lower() != "active":
+                missing.append("注册状态不是 active")
+            if not email:
+                missing.append("邮箱")
+            if not _clean_text(source.get("password")):
+                missing.append("登录密码")
+            if not _normalize_bridge_sso(source.get("sso")):
+                missing.append("SSO 登录态")
+            if missing:
+                summary["failed"] += 1
+                results.append(
+                    {
+                        "id": account_id,
+                        "ok": False,
+                        "status": "failed",
+                        "error": f"无法执行 OAuth 授权：缺少或不满足 {'、'.join(missing)}",
+                    }
+                )
+                continue
+
+            if self._grok_oauth_protocol_sink is None:
+                summary["failed"] += 1
+                results.append(
+                    {"id": account_id, "ok": False, "status": "failed", "error": "Grok OAuth 协议授权服务不可用"}
+                )
+                continue
+
+            try:
+                started = self._grok_oauth_protocol_sink(account_id, prioritize=True)
+                if not isinstance(started, dict):
+                    raise RuntimeError("OAuth 协议授权任务未返回有效状态")
+                job = started.get("job") if isinstance(started.get("job"), dict) else {}
+                job_id = _clean_text(job.get("id"))
+                if bool(started.get("reused")):
+                    summary["reused"] += 1
+                    results.append(
+                        {"id": account_id, "ok": True, "status": "reused", "job_id": job_id}
+                    )
+                elif bool(started.get("queued")) or job_id:
+                    summary["queued"] += 1
+                    results.append(
+                        {"id": account_id, "ok": True, "status": "queued", "job_id": job_id}
+                    )
+                else:
+                    raise RuntimeError("OAuth 协议授权任务未进入队列")
+            except Exception as error:
+                summary["failed"] += 1
+                results.append(
+                    {
+                        "id": account_id,
+                        "ok": False,
+                        "status": "failed",
+                        "error": _clean_text(error) or type(error).__name__,
+                    }
+                )
+
+        level = "green" if summary["failed"] == 0 else "yellow"
+        self._append_grok_oauth_log(
+            "Grok OAuth 手动授权："
+            f"新排队 {summary['queued']}，队列中 {summary['reused']}，"
+            f"已授权跳过 {summary['skipped']}，失败 {summary['failed']}",
+            level,
+        )
+        return {"summary": summary, "results": results}
+
     @staticmethod
     def _grok_status_matches(item: dict[str, Any], status: str) -> bool:
         status_filter = _clean_text(status).lower()
@@ -1162,6 +1434,10 @@ class RegisterService:
             return _clean_text(item.get("probe_status")).lower() == "invalid"
         if status_filter == "probe_unknown":
             return _clean_text(item.get("probe_status")).lower() == "unknown"
+        if status_filter.startswith("oauth_"):
+            oauth_status = status_filter.removeprefix("oauth_")
+            if oauth_status in {"unauthorized", "normal", "limited", "expired", "invalid"}:
+                return _grok_oauth_display_status(item.get("oauth")) == oauth_status
         runtime_aliases = {
             "normal": "active",
             "limited": "cooling",
@@ -1176,19 +1452,15 @@ class RegisterService:
     def grok_accounts_view(self, *, keyword: str = "", status: str = "all") -> dict[str, Any]:
         runtime_available = False
         runtime_error = ""
-        remote_items: list[dict[str, Any]] = []
         config = self._grok_config_snapshot()
         if _safe_bool(config.get("grok2api_enabled"), False):
             try:
-                remote_items = self._runtime_tokens(self._grok2api_client().list())
-                runtime_available = True
+                runtime_available, runtime_error = self._grok2api_client().readiness()
             except Exception as error:
                 runtime_error = self._grok2api_error_text(error)
-            else:
-                try:
-                    grok_account_store.reconcile_runtime_accounts(remote_items)
-                except Exception as error:
-                    runtime_error = f"运行池已读取，但本地档案同步失败: {self._grok2api_error_text(error)}"
+        if not runtime_error:
+            with self._lock:
+                runtime_error = self._grok_runtime_snapshot_error
 
         local_items = grok_account_store.list_accounts(redacted=True)
         raw_items = grok_account_store.get_accounts_by_ids([_clean_text(item.get("id")) for item in local_items])
@@ -1209,23 +1481,17 @@ class RegisterService:
             for item in grok_account_store.list_accounts(redacted=True, keyword=keyword, status="all")
         }
 
-        remote_by_token: dict[str, dict[str, Any]] = {}
-        for remote in remote_items:
-            token = _normalize_bridge_sso(remote.get("token"))
-            if token:
-                remote_by_token[token] = remote
-
         merged_items: list[dict[str, Any]] = []
         for local in local_items:
             account_id = _clean_text(local.get("id"))
             raw = raw_by_id.get(account_id, {})
             token = _normalize_bridge_sso(raw.get("sso"))
             oauth = oauth_by_email.get(_clean_text(raw.get("email")).lower())
-            remote = remote_by_token.get(token) if token and runtime_available else None
             cached_runtime = raw.get("runtime") if isinstance(raw.get("runtime"), dict) else {}
             cached_probe = raw.get("probe") if isinstance(raw.get("probe"), dict) else {}
             cached_recovery = raw.get("recovery") if isinstance(raw.get("recovery"), dict) else {}
             cached_status = _clean_text(cached_runtime.get("status")) if cached_runtime else ""
+            cached_runtime_present = bool(cached_runtime) and cached_runtime.get("present") is not False
             merged = {
                 **local,
                 "token_preview": _token_preview(token),
@@ -1254,49 +1520,26 @@ class RegisterService:
                 "sync_state": (
                     "not_ready"
                     if not token
+                    else "synced"
+                    if cached_runtime_present
                     else "not_synced"
-                    if runtime_available or cached_runtime.get("present") is False
+                    if cached_runtime.get("present") is False
                     else "unknown"
                 ),
                 "oauth": oauth if isinstance(oauth, dict) and oauth else None,
             }
-            if isinstance(remote, dict):
-                merged.update(
-                    {
-                        "pool": _clean_text(remote.get("pool")) or "auto",
-                        "runtime_status": _clean_text(remote.get("status")) or "active",
-                        "quota": _quota_brief(remote.get("quota")),
-                        "use_count": max(0, _safe_int(remote.get("use_count"))),
-                        "fail_count": max(0, _safe_int(remote.get("fail_count"))),
-                        "last_used_at": remote.get("last_used_at"),
-                        "tags": [_clean_text(value) for value in remote.get("tags", []) if _clean_text(value)]
-                        if isinstance(remote.get("tags"), list)
-                        else [],
-                        "refresh_status": _clean_text(remote.get("refresh_status")).lower(),
-                        "refresh_at": remote.get("refresh_at"),
-                        "refresh_error": _clean_text(remote.get("refresh_error"))[:300],
-                        "sync_state": "synced",
-                    }
-                )
             merged_items.append(merged)
 
-        local_tokens = {
-            token
-            for item in raw_items
-            if (token := _normalize_bridge_sso(item.get("sso")))
-        }
-        matched_remote_items = [
-            remote
-            for remote in remote_items
-            if _normalize_bridge_sso(remote.get("token")) in local_tokens
-        ]
+        cached_runtime_items = [item for item in merged_items if item.get("sync_state") == "synced"]
         runtime_status = {"active": 0, "cooling": 0, "invalid": 0, "disabled": 0}
         quota_summary = {mode: 0 for mode in _GROK_QUOTA_MODES}
         calls_total = 0
-        for remote in matched_remote_items:
-            runtime_status[_runtime_status_bucket(remote.get("status"))] += 1
-            calls_total += max(0, _safe_int(remote.get("use_count"))) + max(0, _safe_int(remote.get("fail_count")))
-            quota = _quota_brief(remote.get("quota"))
+        for runtime_item in cached_runtime_items:
+            runtime_status[_runtime_status_bucket(runtime_item.get("runtime_status"))] += 1
+            calls_total += max(0, _safe_int(runtime_item.get("use_count"))) + max(
+                0, _safe_int(runtime_item.get("fail_count"))
+            )
+            quota = runtime_item.get("quota") if isinstance(runtime_item.get("quota"), dict) else {}
             for mode in _GROK_QUOTA_MODES:
                 quota_summary[mode] += max(0, _safe_int(quota.get(mode, {}).get("remaining")))
 
@@ -1309,7 +1552,7 @@ class RegisterService:
             "failed": sum(1 for value in local_statuses if value in _GROK_FAILED_STATUSES),
             "synced": sum(1 for item in merged_items if item.get("sync_state") == "synced"),
             "not_synced": sum(1 for item in merged_items if item.get("sync_state") == "not_synced"),
-            "runtime_total": len(matched_remote_items),
+            "runtime_total": len(cached_runtime_items),
             "oauth_total": len(oauth_raw_items),
             "oauth_linked": sum(1 for item in merged_items if isinstance(item.get("oauth"), dict)),
             "oauth_status": {
@@ -1978,6 +2221,8 @@ class RegisterService:
             email = _clean_text(item.get("email")).lower()
             if not email or email in oauth_emails or email in sources_by_email:
                 continue
+            if _clean_text(item.get("status")).lower() != "active" or not _clean_text(item.get("sso")):
+                continue
             if not _clean_text(item.get("id")) or not _clean_text(item.get("password")):
                 missing_credentials += 1
                 continue
@@ -1993,7 +2238,7 @@ class RegisterService:
             return False
         return bool(sources)
 
-    def _queue_unlinked_grok_oauth_accounts(self, *, limit: int = _GROK_OAUTH_BACKFILL_LIMIT) -> dict[str, int]:
+    def _queue_unlinked_grok_oauth_accounts(self, *, limit: int | None = None) -> dict[str, int]:
         summary = {
             "eligible": 0,
             "attempted": 0,
@@ -2012,7 +2257,7 @@ class RegisterService:
         sources, missing_credentials = self._grok_oauth_unlinked_sources()
         summary["eligible"] = len(sources)
         summary["missing_credentials"] = missing_credentials
-        max_attempts = max(1, min(_GROK_OAUTH_BACKFILL_LIMIT, int(limit or 1)))
+        max_attempts = len(sources) if limit is None else max(0, int(limit))
         for index, source in enumerate(sources):
             if summary["attempted"] >= max_attempts:
                 summary["deferred"] += len(sources) - index
@@ -2088,7 +2333,6 @@ class RegisterService:
             with self._lock:
                 initial_probe = self._grok_probe_config_locked()
                 recovery_sweep_due = self._grok_oauth_recovery_sweep_due(initial_probe)
-                recovery_limit = max(1, min(500, _safe_int(initial_probe.get("batch_size"), 50) or 50))
             recovery_sweep_due = (
                 recovery_sweep_due
                 or self._grok_oauth_has_inflight_recovery()
@@ -2096,7 +2340,6 @@ class RegisterService:
             )
             if recovery_sweep_due and not stop_event.is_set():
                 self._run_grok_oauth_recovery_sweep(
-                    limit=recovery_limit,
                     reclaim_inflight=True,
                 )
             while not stop_event.is_set():
@@ -2168,7 +2411,7 @@ class RegisterService:
             result_summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
             summary["uploaded"] = max(0, _safe_int(result_summary.get("delivery_success")))
             level = "green" if summary["valid"] else "yellow"
-            self._append_log(
+            self._append_grok_oauth_log(
                 "Grok OAuth 权限延迟复检完成："
                 f"恢复 {summary['valid']}，待生效 {summary['pending']}，"
                 f"其他失败 {summary['failed']}，已上传 {summary['uploaded']}",
@@ -2176,7 +2419,7 @@ class RegisterService:
             )
         except Exception as error:
             summary["failed"] = len(selected)
-            self._append_log(
+            self._append_grok_oauth_log(
                 f"Grok OAuth 权限延迟复检失败：{self._grok2api_error_text(error)}",
                 "red",
             )
@@ -2185,7 +2428,7 @@ class RegisterService:
     def _run_grok_oauth_recovery_sweep(
         self,
         *,
-        limit: int,
+        limit: int | None = None,
         reclaim_inflight: bool = False,
     ) -> dict[str, int]:
         summary = {
@@ -2236,7 +2479,7 @@ class RegisterService:
                 and _clean_text(item.get("password"))
                 and _clean_text(item.get("status")).lower() == "active"
             }
-            max_attempts = max(1, min(500, int(limit or 1)))
+            max_attempts = len(candidates) if limit is None else max(0, int(limit))
             for index, candidate in enumerate(candidates):
                 if summary["attempted"] >= max_attempts:
                     summary["deferred"] += len(candidates) - index
@@ -2284,6 +2527,10 @@ class RegisterService:
                     ) else "success"
                 self._append_grok_probe_event_locked(message, level)
                 self._save()
+            self._append_grok_oauth_log(
+                message,
+                "red" if level == "error" else "yellow" if level == "warning" else "green",
+            )
         return summary
 
     def _run_grok_probe_once(self, stop_event: threading.Event | None = None) -> dict[str, int]:
@@ -2444,9 +2691,6 @@ class RegisterService:
                         summary[f"oauth_{key}"] += 1
                         if status != "invalid" or not isinstance(result, dict):
                             continue
-                        if summary["oauth_recovery_attempted"] >= batch_size:
-                            summary["oauth_recovery_deferred"] += 1
-                            continue
                         oauth_account_id = _clean_text(result.get("account_id"))
                         candidate = oauth_by_id.get(oauth_account_id)
                         if not isinstance(candidate, dict):
@@ -2569,6 +2813,72 @@ class RegisterService:
     def export_grok_accounts_text(self) -> str:
         return grok_account_store.export_text()
 
+    def _grok_oauth_export_accounts(self, ids: list[str] | None = None) -> list[dict[str, Any]]:
+        selected_ids = list(dict.fromkeys(_clean_text(value) for value in (ids or []) if _clean_text(value)))
+        selected = ids is not None
+        source_accounts = (
+            grok_account_store.get_accounts_by_ids(selected_ids)
+            if selected
+            else grok_account_store.list_accounts(redacted=False)
+        )
+        selected_emails = {
+            _clean_text(item.get("email")).lower()
+            for item in source_accounts
+            if _clean_text(item.get("email"))
+        }
+        sso_by_email = {
+            _clean_text(item.get("email")).lower(): _normalize_bridge_sso(item.get("sso"))
+            for item in source_accounts
+            if _clean_text(item.get("email")) and _normalize_bridge_sso(item.get("sso"))
+        }
+        result: list[dict[str, Any]] = []
+        for account in xai_cli_oauth_store.list_accounts(redacted=False):
+            if not _clean_text(account.get("access_token")) or not _clean_text(account.get("refresh_token")):
+                continue
+            exported = dict(account)
+            email_key = _clean_text(exported.get("email")).lower()
+            if selected and email_key not in selected_emails:
+                continue
+            if email_key and sso_by_email.get(email_key):
+                exported["sso_token"] = sso_by_email[email_key]
+            result.append(exported)
+        return result
+
+    def export_grok_accounts_sub2api(self, ids: list[str] | None = None) -> dict[str, Any]:
+        accounts = [
+            build_xai_oauth_export_account(account)
+            for account in self._grok_oauth_export_accounts(ids)
+        ]
+        if not accounts:
+            raise ValueError("暂无可导出的 Grok OAuth 账号")
+        return {
+            "exported_at": _now(),
+            "proxies": [],
+            "accounts": accounts,
+        }
+
+    def export_grok_accounts_cpa(self, ids: list[str] | None = None) -> bytes:
+        accounts = self._grok_oauth_export_accounts(ids)
+        if not accounts:
+            raise ValueError("暂无可导出的 Grok OAuth 账号")
+        buffer = io.BytesIO()
+        used_names: set[str] = set()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for account in accounts:
+                file_name, payload = cpa_service.build_xai_oauth_file(account)
+                stem, suffix = file_name.rsplit(".", 1)
+                unique_name = file_name
+                duplicate = 2
+                while unique_name in used_names:
+                    unique_name = f"{stem}-{duplicate}.{suffix}"
+                    duplicate += 1
+                used_names.add(unique_name)
+                archive.writestr(
+                    unique_name,
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                )
+        return buffer.getvalue()
+
     def _persist_grok_account_snapshot(self, payload: dict) -> dict:
         saved = grok_account_store.upsert(payload)
         item = saved.get("item") if isinstance(saved.get("item"), dict) else {}
@@ -2584,13 +2894,13 @@ class RegisterService:
                 except Exception as error:
                     self._append_log(
                         "导入内置 Grok 账号池失败: "
-                        f"{self._mask_email(email)}，原因: {self._grok2api_error_text(error, [token])}",
+                        f"{email}，原因: {self._grok2api_error_text(error, [token])}",
                         "red",
                     )
                 else:
                     runtime_synced = True
             self._append_log(
-                f"Grok 账号已保存{'并加入账号池' if runtime_synced else ''}：{self._mask_email(email)}",
+                f"Grok 账号已保存{'并加入账号池' if runtime_synced else ''}：{email}",
                 "green",
             )
         return saved
@@ -2617,13 +2927,14 @@ class RegisterService:
         item = saved.get("item") if isinstance(saved.get("item"), dict) else {}
         account_id = _clean_text(item.get("id"))
         email = _clean_text(item.get("email"))
+        masked_email = self._mask_email(email)
         if not account_id or self._grok_oauth_protocol_sink is None:
             return
         try:
             started = self._grok_oauth_protocol_sink(account_id, prioritize=True)
         except Exception as error:
-            self._append_log(
-                f"Grok OAuth 协议授权启动失败: {self._mask_email(email)}，原因: {self._grok2api_error_text(error)}",
+            self._append_grok_oauth_log(
+                f"Grok OAuth 协议授权启动失败: {masked_email}，原因: {self._grok2api_error_text(error)}",
                 "red",
             )
             return
@@ -2633,19 +2944,20 @@ class RegisterService:
             state = "已进入即时上传队列"
         else:
             state = "已启动"
-        self._append_log(
-            f"Grok OAuth 授权{state}：{self._mask_email(email)}",
+        self._append_grok_oauth_log(
+            f"Grok OAuth 授权{state}：{masked_email}",
             "yellow",
         )
 
     def handle_grok_oauth_protocol_event(self, event: dict[str, Any]) -> None:
-        email = self._mask_email(_clean_text(event.get("email")))
+        email = _clean_text(event.get("email"))
+        masked_email = self._mask_email(email)
         job_id = _clean_text(event.get("job_id"))
         recovery_account = xai_cli_oauth_store.find_by_recovery_job_id(job_id) if job_id else None
         recovery_account_id = _clean_text(recovery_account.get("id")) if isinstance(recovery_account, dict) else ""
         if _clean_text(event.get("status")) == "permission_pending":
-            self._append_log(
-                f"Grok OAuth 授权完成，Grok 4.5 权限待生效，已进入延迟复检：{email}",
+            self._append_grok_oauth_log(
+                f"Grok OAuth 授权完成，Grok 4.5 权限待生效，已进入延迟复检：{masked_email}",
                 "yellow",
             )
             return
@@ -2668,7 +2980,10 @@ class RegisterService:
                     error=error,
                 )
             else:
-                self._append_log(f"Grok OAuth 协议授权失败：{email}，原因: {error}", "red")
+                self._append_grok_oauth_log(
+                    f"Grok OAuth 协议授权失败：{masked_email}，原因: {error}",
+                    "red",
+                )
             return
 
         if recovery_account_id:
@@ -2698,19 +3013,33 @@ class RegisterService:
             targets = "、".join("NovaApi" if name == "sub2api" else name.upper() for name in uploaded)
             suffix = f"；{len(failed)} 个投递目标失败" if failed else ""
             action = "自动恢复完成" if recovery_account_id else "授权完成"
-            self._append_log(f"Grok OAuth {action}，已上传到 {targets}：{email}{suffix}", "green")
+            self._append_grok_oauth_log(
+                f"Grok OAuth {action}，已上传到 {targets}：{masked_email}{suffix}",
+                "green",
+            )
         elif failed:
             targets = "、".join("NovaApi" if name == "sub2api" else name.upper() for name in failed)
             action = "自动恢复完成" if recovery_account_id else "授权完成"
-            self._append_log(f"Grok OAuth {action}，但上传到 {targets} 失败：{email}", "red")
+            self._append_grok_oauth_log(
+                f"Grok OAuth {action}，但上传到 {targets} 失败：{masked_email}",
+                "red",
+            )
         else:
             action = "自动恢复完成" if recovery_account_id else "授权完成"
-            self._append_log(f"Grok OAuth {action}，未启用外部投递：{email}", "yellow")
+            self._append_grok_oauth_log(
+                f"Grok OAuth {action}，未启用外部投递：{masked_email}",
+                "yellow",
+            )
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
+
+    def _append_grok_oauth_log(self, text: str, color: str = "") -> None:
+        with self._lock:
+            self._grok_oauth_logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
+            self._grok_oauth_logs = self._grok_oauth_logs[-300:]
 
     def _append_checkout_log(self, text: str, color: str = "") -> None:
         with self._lock:
@@ -3295,14 +3624,16 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
-    def _run(self, target: str, backend) -> None:
-        threads = int(self.get()["threads"])
+    def _run(self, target: str, backend, run_options: dict[str, Any] | None = None) -> None:
+        options = dict(run_options or {})
+        threads = max(1, int(options.get("threads") or self.get()["threads"]))
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
                 cfg = self.get()
                 cfg["target"] = target
+                cfg.update(options)
                 if target == "grok":
                     cfg["mode"] = "total"
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:

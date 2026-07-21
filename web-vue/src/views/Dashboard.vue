@@ -1,10 +1,21 @@
 <template>
   <div class="space-y-5">
     <PageLoadingState
-      v-if="!dashboardDataReady"
+      v-if="!dashboardDataReady && dashboardLoading"
       title="正在加载概览"
       description="读取最新账号、调用趋势和模型统计。"
     />
+
+    <StateBlock
+      v-else-if="!dashboardDataReady"
+      dashed
+      title="概览加载失败"
+      :description="dashboardLoadError || '后台暂时繁忙，请稍后重试。'"
+    >
+      <Button class="mt-4" size="sm" variant="outline" @click="retryDashboard">
+        重新加载
+      </Button>
+    </StateBlock>
 
     <template v-else>
     <section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -74,8 +85,9 @@
 </template>
 
 <script setup lang="ts">
-import { ChartCard, StatCard } from 'nanocat-ui'
+import { Button, ChartCard, StatCard } from 'nanocat-ui'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
+import StateBlock from '@/components/ai/StateBlock.vue'
 import TimeRangeTabs from '@/components/ai/TimeRangeTabs.vue'
 import { useDashboardPage } from './dashboard/useDashboardPage'
 
@@ -84,6 +96,9 @@ defineOptions({ name: 'Dashboard' })
 const {
   stats,
   dashboardDataReady,
+  dashboardLoading,
+  dashboardLoadError,
+  retryDashboard,
   timeRangeHourlyRequests,
   timeRangeTrend,
   timeRangeSuccessRate,

@@ -72,19 +72,26 @@ class Grok2APIAccountClient:
             self.timeout = 30
         self._session = session or Session(trust_env=False)
 
-    def _require_ready(self) -> None:
+    def readiness(self) -> tuple[bool, str]:
+        """Return configuration/runtime readiness without making a remote call."""
         if not self.enabled:
-            raise Grok2APIAccountError("Grok runtime is disabled")
+            return False, "Grok runtime is disabled"
         if self.embedded:
             from services.grok_runtime import grok_runtime
 
             if not grok_runtime.available:
-                raise Grok2APIAccountError("Embedded Grok runtime is not ready")
-            return
+                return False, "内置 Grok 运行时尚未启动"
+            return True, ""
         if not self.api_base:
-            raise Grok2APIAccountError("Grok2API api_base is required")
+            return False, "Grok2API api_base is required"
         if not self.admin_key:
-            raise Grok2APIAccountError("Grok2API admin_key is required")
+            return False, "Grok2API admin_key is required"
+        return True, ""
+
+    def _require_ready(self) -> None:
+        ready, error = self.readiness()
+        if not ready:
+            raise Grok2APIAccountError(error)
 
     @staticmethod
     def _payload_secrets(payload: object) -> list[str]:
