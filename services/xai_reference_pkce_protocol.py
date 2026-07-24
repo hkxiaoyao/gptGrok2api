@@ -82,6 +82,7 @@ class XaiReferencePkceProtocol:
         self._validate_reference()
         self._emit("pkce", "复用注册会话执行 Authorization Code + PKCE")
         system_solver = None
+        consent_denied = False
         try:
             with _REFERENCE_IMPORT_LOCK:
                 reference_path = str(self.reference_dir)
@@ -97,6 +98,16 @@ class XaiReferencePkceProtocol:
                 impersonate=impersonate,
                 debug=False,
             )
+
+            def capture_reference_log(message: object) -> None:
+                nonlocal consent_denied
+                lowered = str(message or "").lower()
+                if "access_denied" in lowered or "access denied" in lowered:
+                    consent_denied = True
+
+            # The reference client currently retries after an explicit consent
+            # denial and eventually reports a misleading redirect-loop error.
+            client._log = capture_reference_log
             if self.turnstile_config:
                 from services.register.grok_protocol import TurnstileSolver
 
@@ -144,6 +155,14 @@ class XaiReferencePkceProtocol:
             raise
         except Exception as exc:
             detail = " ".join(str(exc or type(exc).__name__).split()) or type(exc).__name__
+            lowered = detail.lower()
+            if consent_denied or "access_denied" in lowered or "access denied" in lowered:
+                raise XaiReferencePkceProtocolError(
+                    "xAI OAuth consent denied: Access denied "
+                    "(账号未获得 Grok Build/API OAuth 授权资格)",
+                    stage="pkce_consent",
+                    retryable=False,
+                ) from exc
             raise XaiReferencePkceProtocolError(
                 f"PKCE live-session authorization failed: {detail[:400]}",
                 stage="pkce",

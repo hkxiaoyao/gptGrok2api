@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from services.xai_reference_pkce_protocol import XaiReferencePkceProtocol
+from services.xai_reference_pkce_protocol import (
+    XaiReferencePkceProtocol,
+    XaiReferencePkceProtocolError,
+)
 
 
 class XaiReferencePkceProtocolTest(unittest.TestCase):
@@ -127,6 +130,48 @@ class XaiReferencePkceProtocolTest(unittest.TestCase):
             action="oauth-action",
         )
         system_solver.close.assert_called_once_with()
+
+    def test_live_authorization_surfaces_consent_denial_instead_of_redirect_loop(self) -> None:
+        class FakeSession:
+            def close(self) -> None:
+                pass
+
+        class FakeClient:
+            def __init__(self, **_kwargs: object) -> None:
+                self._s = FakeSession()
+
+            def login(self, *_args: object, **_kwargs: object) -> object:
+                self._log('consent action HTTP 200: {"success":false,"error":"Access denied"}')
+                raise RuntimeError("OAuth redirect loop at https://accounts.x.ai/sign-in")
+
+        package = types.ModuleType("xconsole_client")
+        package.__path__ = []
+        module = types.ModuleType("xconsole_client.oauth_protocol")
+        module.ProtocolOAuthClient = FakeClient
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_dir = Path(temp_dir)
+            protocol_file = reference_dir / "xconsole_client" / "oauth_protocol.py"
+            protocol_file.parent.mkdir()
+            protocol_file.write_text("# test fixture\n", encoding="utf-8")
+            protocol = XaiReferencePkceProtocol(str(reference_dir))
+            with patch.dict(
+                sys.modules,
+                {
+                    "xconsole_client": package,
+                    "xconsole_client.oauth_protocol": module,
+                },
+            ), self.assertRaises(XaiReferencePkceProtocolError) as raised:
+                protocol.authorize_live_session(
+                    email="person@example.com",
+                    password="password",
+                    session=object(),
+                )
+
+        self.assertEqual(raised.exception.stage, "pkce_consent")
+        self.assertFalse(raised.exception.retryable)
+        self.assertIn("Access denied", str(raised.exception))
+        self.assertNotIn("redirect loop", str(raised.exception))
 
 
 if __name__ == "__main__":
